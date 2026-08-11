@@ -840,7 +840,10 @@ fn external_build_declares_fulltext_indexes() {
     let filtered = search(
         &r,
         &FulltextQuery {
-            filters: vec![vec![(2, "g".to_string())]],
+            filters: vec![vec![graph_format::fulltext::search::FilterAlternative {
+                field: 2,
+                terms: vec!["g".to_string()],
+            }]],
             terms: vec!["alice".to_string()],
         },
         node.avg_doc_len,

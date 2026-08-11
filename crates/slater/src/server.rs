@@ -1036,6 +1036,9 @@ pub(crate) struct ConnCtx {
     /// Beam-search list size for the per-segment read-only temp indexes
     /// (`vectorQuery.tempBeamWidth`, HIK-113).
     temp_beam_width: usize,
+    /// Per-call hit cap for `db.idx.fulltext.query*` (`fulltext.maxHits`). The procedure
+    /// takes no `k`, so this is the only thing bounding its result set.
+    fulltext_max_hits: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
     bind_addr: String,
     /// Graph flagged as the home database in `SHOW DATABASES` (`config.defaultGraph`);

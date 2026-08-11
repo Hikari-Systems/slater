@@ -11046,6 +11046,7 @@ fn build_writable_ctx_caps(
     std::fs::write(&acl_path, json.to_string()).unwrap();
     let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
     let ctx = Arc::new(ConnCtx {
+        fulltext_max_hits: crate::config::DEFAULT_FULLTEXT_MAX_HITS,
         acl,
         graphs,
         cache: Arc::new(BlockCache::new(1 << 20)),
@@ -11285,6 +11286,7 @@ fn build_ctx_limited(tag: &str, limits: TestLimits) -> (std::path::PathBuf, Arc<
     }
     let result_cache = Arc::new(ResultCache::new(1 << 20));
     let ctx = Arc::new(ConnCtx {
+        fulltext_max_hits: crate::config::DEFAULT_FULLTEXT_MAX_HITS,
         acl,
         graphs,
         cache,
@@ -11391,6 +11393,7 @@ fn build_multi_ctx(tag: &str) -> Arc<ConnCtx> {
     let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
     let graphs = Arc::new(Graphs::open_all(&root, None).unwrap());
     Arc::new(ConnCtx {
+        fulltext_max_hits: crate::config::DEFAULT_FULLTEXT_MAX_HITS,
         acl,
         graphs,
         cache: Arc::new(BlockCache::new(1 << 20)),

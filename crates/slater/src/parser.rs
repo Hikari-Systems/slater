@@ -395,6 +395,7 @@ pub mod ast {
         Match(MatchClause),
         With(WithClause),
         VectorCall(VectorCallClause),
+        FulltextCall(FulltextCallClause),
         Call(CallClause),
         CallSubquery(CallSubqueryClause),
         Unwind(UnwindClause),
@@ -476,6 +477,28 @@ pub mod ast {
         pub yields: Vec<(String, String)>,
         /// An optional `WHERE` filtering the yielded rows (FalkorDB's
         /// `YIELD ... WHERE ...`).
+        pub where_: Option<Expr>,
+    }
+
+    /// `CALL db.idx.fulltext.queryNodes('Label', $q) YIELD node, score`, and its
+    /// `queryRelationships` twin. Binds its YIELD outputs into scope like the vector
+    /// procedure does.
+    ///
+    /// Two arguments, not four: graphiti passes only `(label, query)`, so there is no `k`
+    /// and the result set is bounded by configuration instead. See `fulltext.maxHits`.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct FulltextCallClause {
+        /// Node label or relationship type the index covers (arg 0, a string literal).
+        pub label: String,
+        /// The query string (arg 1; a literal or `$param` — graphiti always sends
+        /// `$query`). Parsed against the index's declared fields at execution, since the
+        /// field names it may reference are a property of the index, not of the statement.
+        pub query: Expr,
+        /// `true` for `queryRelationships`. Decides which index is looked up and whether
+        /// the bound value is a node or a relationship.
+        pub relationships: bool,
+        /// `(procedure output, bound variable)` pairs from `YIELD`.
+        pub yields: Vec<(String, String)>,
         pub where_: Option<Expr>,
     }
 
@@ -2126,6 +2149,7 @@ fn clause_nd(c: &Clause) -> bool {
         Clause::VectorCall(v) => {
             expr_nd(&v.k) || expr_nd(&v.query_vec) || v.where_.as_ref().is_some_and(expr_nd)
         }
+        Clause::FulltextCall(f) => expr_nd(&f.query) || f.where_.as_ref().is_some_and(expr_nd),
         Clause::Call(c) => c.args.iter().any(expr_nd) || c.where_.as_ref().is_some_and(expr_nd),
         Clause::CallSubquery(c) => is_nondeterministic(&c.inner),
         Clause::Unwind(u) => expr_nd(&u.expr),
@@ -2313,6 +2337,7 @@ fn lower_reading_clause(pair: Pair<Rule>) -> Result<Clause> {
         Rule::match_clause => Ok(Clause::Match(lower_match_clause(inner)?)),
         Rule::with_clause => Ok(Clause::With(lower_with_clause(inner)?)),
         Rule::vector_call_clause => Ok(Clause::VectorCall(lower_vector_call(inner)?)),
+        Rule::fulltext_call_clause => Ok(Clause::FulltextCall(lower_fulltext_call(inner)?)),
         Rule::call_clause => Ok(Clause::Call(lower_call_clause(inner)?)),
         Rule::call_subquery => Ok(Clause::CallSubquery(lower_call_subquery(inner)?)),
         Rule::unwind_clause => Ok(Clause::Unwind(lower_unwind_clause(inner)?)),
@@ -2541,6 +2566,84 @@ fn lower_vector_call(pair: Pair<Rule>) -> Result<VectorCallClause> {
         property,
         k,
         query_vec,
+        yields,
+        where_,
+    })
+}
+
+fn lower_fulltext_call(pair: Pair<Rule>) -> Result<FulltextCallClause> {
+    let mut args: Vec<Expr> = Vec::new();
+    let mut yields: Vec<(String, String)> = Vec::new();
+    let mut where_ = None;
+    let mut relationships = false;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::fulltext_proc => {
+                relationships = child
+                    .as_str()
+                    .to_ascii_lowercase()
+                    .ends_with("queryrelationships");
+            }
+            Rule::where_clause => where_ = Some(lower_expr(only_child(child)?)?),
+            Rule::func_arg => {
+                let inner = only_child(child)?;
+                if inner.as_rule() == Rule::star_arg {
+                    bail!("db.idx.fulltext.query* does not take '*' as an argument");
+                }
+                args.push(lower_expr(inner)?);
+            }
+            Rule::yield_clause => {
+                for item in kids(child) {
+                    if item.as_rule() != Rule::yield_item {
+                        continue;
+                    }
+                    let mut it = kids(item);
+                    let output = ident_text(it.next().unwrap())?;
+                    let bound = it
+                        .next()
+                        .map(ident_text)
+                        .transpose()?
+                        .unwrap_or_else(|| output.clone());
+                    yields.push((output, bound));
+                }
+            }
+            other => bail!("internal: unexpected fulltext_call child {other:?}"),
+        }
+    }
+    let proc = if relationships {
+        "db.idx.fulltext.queryRelationships"
+    } else {
+        "db.idx.fulltext.queryNodes"
+    };
+    if args.len() != 2 {
+        bail!(
+            "{proc} expects 2 arguments (label, query), got {}",
+            args.len()
+        );
+    }
+    let mut args = args.into_iter();
+    let label = match args.next().unwrap() {
+        Expr::Literal(Value::Str(s)) => s,
+        other => bail!("{proc} label must be a string literal, got {other:?}"),
+    };
+    let query = args.next().unwrap();
+    // The two procedures bind different things, and mixing them up is the mistake worth
+    // naming: a relationship search that yielded `node` would leave the caller's follow-on
+    // `MATCH (n)-[e {uuid: rel.uuid}]->(m)` unable to bind.
+    let want = if relationships {
+        "relationship"
+    } else {
+        "node"
+    };
+    for (output, _) in &yields {
+        if output != want && output != "score" {
+            bail!("{proc} only yields '{want}' and 'score', not '{output}'");
+        }
+    }
+    Ok(FulltextCallClause {
+        label,
+        query,
+        relationships,
         yields,
         where_,
     })
@@ -4963,10 +5066,11 @@ mod tests {
             ("MATCH (n) DETACH DELETE n", "DETACH"),
             ("MERGE (n:Person {name: 'A'}) RETURN n", "MERGE"),
             ("MATCH (n) REMOVE n:Person RETURN n", "REMOVE"),
-            // Every procedure call is rejected EXCEPT the one vector KNN form.
+            // A procedure call in a *read* position is rejected unless it is one of the
+            // whitelisted read procedures (`forbidden_clause`'s negative lookahead).
             ("CALL db.labels() YIELD label RETURN label", "CALL"),
             (
-                "CALL db.idx.fulltext.queryNodes('L', 'q') YIELD node RETURN node",
+                "CALL db.idx.vector.createNodeIndex('L', 'p', 3, 'cosine')",
                 "CALL",
             ),
         ] {
@@ -4976,6 +5080,14 @@ mod tests {
                 "for {q:?} expected read-only/{kw}, got: {e}"
             );
         }
+
+        // …and the search procedures are on that whitelist, so they parse. This pair used
+        // to sit in the rejected list above: `db.idx.fulltext.*` was refused as an
+        // unsupported *write* until the full-text work landed, which is exactly the
+        // confusing error the live probe returned.
+        ok("CALL db.idx.vector.queryNodes('L', 'p', 3, $v) YIELD node RETURN node");
+        ok("CALL db.idx.fulltext.queryNodes('L', $q) YIELD node RETURN node");
+        ok("CALL db.idx.fulltext.queryRelationships('T', $q) YIELD relationship AS r RETURN r");
     }
 
     /// The all-literal `vecf32([...])` write spelling folds to a `Value::Vector` literal

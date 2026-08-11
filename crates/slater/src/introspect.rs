@@ -175,11 +175,23 @@ pub(crate) fn show_databases_memgraph(dbs: &[(String, bool)]) -> Rows {
 pub(crate) fn show_procedures() -> Rows {
     (
         cols(&["name", "description", "mode"]),
-        vec![vec![
-            s("db.idx.vector.queryNodes"),
-            s("Approximate/exact vector KNN over a node vector index."),
-            s("READ"),
-        ]],
+        vec![
+            vec![
+                s("db.idx.vector.queryNodes"),
+                s("Approximate/exact vector KNN over a node vector index."),
+                s("READ"),
+            ],
+            vec![
+                s("db.idx.fulltext.queryNodes"),
+                s("BM25 full-text search over a node full-text index."),
+                s("READ"),
+            ],
+            vec![
+                s("db.idx.fulltext.queryRelationships"),
+                s("BM25 full-text search over a relationship full-text index."),
+                s("READ"),
+            ],
+        ],
     )
 }
 

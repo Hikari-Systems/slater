@@ -19,13 +19,14 @@ use anyhow::{bail, Context, Result};
 use graph_format::blockfile::BlockFileReader;
 use graph_format::columns::PropsReader;
 use graph_format::crypto::{self, file_cipher, BlockCipher};
+use graph_format::fulltext::index::{file_names as ft_file_names, FulltextReader};
 use graph_format::histogram::decode_histogram;
 use graph_format::ids::Generation as GenId;
 use graph_format::ids::Value;
 use graph_format::isam::IsamReader;
 use graph_format::manifest::AnnMode;
-use graph_format::manifest::Manifest;
 use graph_format::manifest::VectorIndexDesc;
+use graph_format::manifest::{EntityKind, FulltextIndexDesc, Manifest};
 use graph_format::nodelabels::NodeLabelsReader;
 use graph_format::postings::{
     decode_endpoint_posting, endpoint_posting_cursor, EndpointPostingIter,
@@ -78,6 +79,11 @@ pub struct Generation {
     reltype_src_post: Option<BlockFileReader>,
     reltype_tgt_post: Option<BlockFileReader>,
     vectors: VectorStoreReader,
+    /// Full-text indexes keyed by `(entity, label_or_type)` — the way a query names one,
+    /// since `db.idx.fulltext.query*` takes a label rather than an index name. Absent for
+    /// a declared index whose files are missing, which is the state a relationship index
+    /// is in until the edge build pass lands: declared, and answering nothing.
+    fulltext_indexes: HashMap<(EntityKind, String), FulltextReader>,
     /// Range (ISAM) indexes keyed by their MANIFEST `name` (= file stem under `range/`).
     range_indexes: HashMap<String, IsamReader>,
     /// Per-(label, property) value→count histograms (`prop_hist.blk`), keyed by the
@@ -521,6 +527,43 @@ impl Generation {
             })
             .collect::<Result<HashMap<_, _>>>()?;
 
+        // Full-text indexes. Opened by existence rather than by declaration: a descriptor
+        // can legitimately name an index whose files were never written (a relationship
+        // index today), and refusing to open the generation over that would take the whole
+        // graph down for a degraded search leg. A missing index simply answers nothing,
+        // which is what a declaration matching no entity already does.
+        let mut fulltext_indexes = HashMap::new();
+        for fi in &manifest.fulltext_indexes {
+            let stem = format!("fulltext/{}", fi.name);
+            let names = ft_file_names(&stem);
+            let keys: Vec<String> = names.iter().map(|n| join_key(&base, n)).collect();
+            let mut present = true;
+            for k in &keys {
+                if !store.exists(k)? {
+                    present = false;
+                    break;
+                }
+            }
+            if !present {
+                continue;
+            }
+            let srcs = [
+                store.open(&keys[0])?,
+                store.open(&keys[1])?,
+                store.open(&keys[2])?,
+                store.open(&keys[3])?,
+            ];
+            let ciphers = [
+                file_cipher(&cipher, &names[0]),
+                file_cipher(&cipher, &names[1]),
+                file_cipher(&cipher, &names[2]),
+                file_cipher(&cipher, &names[3]),
+            ];
+            let reader = FulltextReader::open_src(srcs, ciphers, fi.entity == EntityKind::Edge)
+                .with_context(|| format!("open full-text index {stem}"))?;
+            fulltext_indexes.insert((fi.entity, fi.label_or_type.clone()), reader);
+        }
+
         // Value→count histograms (format v3+). Gate on existence (a hand-built
         // fixture may omit it). Records align by position with `property_histograms`;
         // decode them resident, keyed by index name.
@@ -730,6 +773,7 @@ impl Generation {
             reltype_tgt_post,
             vectors,
             range_indexes,
+            fulltext_indexes,
             prop_histograms,
             hub_out_degrees,
             hub_in_degrees,
@@ -838,6 +882,22 @@ impl Generation {
     }
     pub fn range_index(&self, name: &str) -> Option<&IsamReader> {
         self.range_indexes.get(name)
+    }
+
+    /// The full-text index over `(entity, label)`, if this generation carries one whose
+    /// files are present. `None` covers both "not declared" and "declared but not built".
+    pub fn fulltext_index(&self, entity: EntityKind, label: &str) -> Option<&FulltextReader> {
+        self.fulltext_indexes.get(&(entity, label.to_string()))
+    }
+
+    /// The manifest descriptor for that index — the corpus statistics (`doc_count`,
+    /// `avg_doc_len`) and the declared property order the query parser resolves `@field`
+    /// against.
+    pub fn fulltext_desc(&self, entity: EntityKind, label: &str) -> Option<&FulltextIndexDesc> {
+        self.manifest()
+            .fulltext_indexes
+            .iter()
+            .find(|f| f.entity == entity && f.label_or_type == label)
     }
 
     /// The precomputed value→count histogram for the range index `name`, if the

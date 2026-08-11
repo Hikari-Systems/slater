@@ -276,11 +276,12 @@ forbidden_query = { reading_clause* ~ forbidden_clause ~ ANY* }
 forbidden_clause = @{
     (^"create" | ^"merge" | ^"insert" | ^"set" | ^"delete" | ^"remove" | ^"detach"
       | ^"foreach" | ^"load") ~ !ident_cont
-  | ^"call" ~ !ident_cont ~ !(inline_ws* ~ "{") ~ !(inline_ws+ ~ (vector_proc | read_proc))
+  | ^"call" ~ !ident_cont ~ !(inline_ws* ~ "{")
+      ~ !(inline_ws+ ~ (vector_proc | fulltext_proc | read_proc))
 }
 inline_ws = _{ " " | "\t" | "\r" | "\n" }
 
-reading_clause = { match_clause | with_clause | vector_call_clause | call_subquery | call_clause | unwind_clause | for_clause }
+reading_clause = { match_clause | with_clause | vector_call_clause | fulltext_call_clause | call_subquery | call_clause | unwind_clause | for_clause }
 
 // `CALL { <subquery> }` (Phase 12): a correlated read-only subquery run once per
 // outer row, multiplying cardinality by its returned rows. The inner body is a
@@ -311,6 +312,21 @@ vector_call_clause = {
     kw_call ~ vector_proc ~ "(" ~ func_arg ~ ("," ~ func_arg)* ~ ")" ~ yield_clause ~ where_clause?
 }
 vector_proc = @{ ^"db.idx.vector.queryNodes" }
+
+// Full-text search. Two arguments — a **label** string literal and the query, which
+// arrives as a `$param`: the same split the vector procedure has, and the shape
+// graphiti's `get_nodes_query` / `get_relationships_query` emit verbatim.
+//
+// Note there is deliberately **no `k`**. Graphiti passes only `(label, query)`, unlike
+// the vector procedure, so the result set is bounded by `fulltext.maxHits` rather than by
+// an argument. A caller wanting fewer takes a `LIMIT`.
+//
+// The two procedures differ in what they yield, because a relationship hit has to bind a
+// relationship: `queryNodes` yields `node`, `queryRelationships` yields `relationship`.
+fulltext_call_clause = {
+    kw_call ~ fulltext_proc ~ "(" ~ func_arg ~ ("," ~ func_arg)* ~ ")" ~ yield_clause ~ where_clause?
+}
+fulltext_proc = @{ ^"db.idx.fulltext.queryNodes" | ^"db.idx.fulltext.queryRelationships" }
 yield_clause = { kw_yield ~ yield_item ~ ("," ~ yield_item)* }
 yield_item = { identifier ~ (kw_as ~ alias)? }
 

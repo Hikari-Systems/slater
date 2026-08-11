@@ -63,6 +63,7 @@ use slater_scalar::ArithmeticOverflow;
 mod access;
 mod driver;
 mod eval;
+mod fulltext;
 mod knn;
 mod matchclause;
 mod proc;
@@ -2683,6 +2684,14 @@ pub struct Engine<'g, V: ReadView> {
     /// config `vectorQuery.tempBeamWidth`). Temp indexes are small and a heavily-superseded
     /// level can under-return, so a wider `L` here is cheap insurance. `0` ⇒ use `beam_width`.
     temp_beam_width: usize,
+    /// Most hits one `db.idx.fulltext.query*` call may return (config
+    /// `fulltext.maxHits`).
+    ///
+    /// It exists because the procedure takes **no `k`** — graphiti passes only
+    /// `(label, query)`, unlike the vector procedure — so without it a disjunction over
+    /// common words would return every matching document. A caller wanting fewer writes a
+    /// `LIMIT`, which is what graphiti does.
+    fulltext_max_hits: usize,
     /// Query-wide intermediate-element budget (config `query.maxIntermediate`);
     /// 0 disables. Charged by every operation that materialises a collection
     /// (comprehensions, UNWIND, list concat, aggregate buffers, varlen paths), so
@@ -2789,6 +2798,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             deadline: None,
             beam_width: 64,
             temp_beam_width: 0,
+            fulltext_max_hits: crate::config::DEFAULT_FULLTEXT_MAX_HITS,
             max_intermediate: DEFAULT_MAX_INTERMEDIATE,
             budget_used: Cell::new(0),
             max_scan: DEFAULT_MAX_SCAN,
@@ -2837,6 +2847,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// tracking `beam_width`.
     pub fn with_temp_beam_width(mut self, temp_beam_width: usize) -> Self {
         self.temp_beam_width = temp_beam_width;
+        self
+    }
+
+    /// Set the per-call full-text hit cap (`fulltext.maxHits`). `0` disables the cap,
+    /// which is only sensible for a test over a tiny index.
+    pub fn with_fulltext_max_hits(mut self, max_hits: usize) -> Self {
+        self.fulltext_max_hits = if max_hits == 0 { usize::MAX } else { max_hits };
         self
     }
 
@@ -2996,6 +3013,8 @@ const SLATER_PROCEDURES: &[&str] = &[
     "algo.labelPropagation",
     "algo.pageRank",
     "db.constraints",
+    "db.idx.fulltext.queryNodes",
+    "db.idx.fulltext.queryRelationships",
     "db.idx.vector.queryNodes",
     "db.indexes",
     "db.labels",

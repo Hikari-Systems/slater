@@ -44,6 +44,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     table = self.project(table, &w.body, w.distinct, w.where_.as_ref())?
                 }
                 Clause::VectorCall(vc) => table = self.apply_vector_call(table, vc)?,
+                Clause::FulltextCall(fc) => table = self.apply_fulltext_call(table, fc)?,
                 Clause::Call(cc) => table = self.apply_call(table, cc)?,
                 Clause::CallSubquery(cs) => table = self.apply_call_subquery(table, cs)?,
                 Clause::Unwind(uc) => table = self.apply_unwind(table, uc)?,

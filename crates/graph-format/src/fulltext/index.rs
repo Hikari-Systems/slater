@@ -60,6 +60,7 @@ use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::FileCipher;
 use crate::ids::Value;
 use crate::isam::{write_isam_sorted, IsamReader};
+use crate::store::RandomReadAt;
 use crate::wire::{read_uvarint, write_uvarint};
 
 /// Documents per posting chunk. Fixed, so a chunk index is a chunk index — the reader
@@ -530,18 +531,40 @@ impl FulltextReader {
     /// `cipher_for` must produce the identical store-relative names
     /// [`write_fulltext_index`] was given, or an encrypted index fails to open — the AAD
     /// binds each block to its file name (HIK-140).
+    ///
+    /// Local paths only. A served generation opens through its store instead, so that it
+    /// works against S3/GCS as well as disk — see [`Self::open_src`].
     pub fn open(
         dir: &Path,
         rel_stem: &str,
         edges: bool,
         cipher_for: &dyn Fn(&str) -> Option<Arc<FileCipher>>,
     ) -> Result<Self> {
-        let n: Vec<String> = SUFFIXES.iter().map(|s| format!("{rel_stem}{s}")).collect();
+        let n = file_names(rel_stem);
         Ok(Self {
             dict: IsamReader::open_with_cipher(dir.join(&n[0]), cipher_for(&n[0]))?,
             meta: BlockFileReader::open_with_cipher(dir.join(&n[1]), cipher_for(&n[1]))?,
             post: BlockFileReader::open_with_cipher(dir.join(&n[2]), cipher_for(&n[2]))?,
             docs: BlockFileReader::open_with_cipher(dir.join(&n[3]), cipher_for(&n[3]))?,
+            edges,
+        })
+    }
+
+    /// Open from four positional-read sources, in [`SUFFIXES`] order — the form a served
+    /// generation uses, so a full-text index works against an object store exactly as the
+    /// range and vector indexes do.
+    pub fn open_src(
+        srcs: [Arc<dyn RandomReadAt>; 4],
+        ciphers: [Option<Arc<FileCipher>>; 4],
+        edges: bool,
+    ) -> Result<Self> {
+        let [d, m, p, o] = srcs;
+        let [cd, cm, cp, co] = ciphers;
+        Ok(Self {
+            dict: IsamReader::open_src(d, cd)?,
+            meta: BlockFileReader::open_src(m, cm)?,
+            post: BlockFileReader::open_src(p, cp)?,
+            docs: BlockFileReader::open_src(o, co)?,
             edges,
         })
     }

@@ -42,6 +42,7 @@ pub(crate) async fn run_query(
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
     let temp_beam_width = ctx.temp_beam_width;
+    let fulltext_max_hits = ctx.fulltext_max_hits;
     let graph_name = gen.graph().to_string();
     // Gate all per-query instrumentation on the info level being active OR
     // load-test diagnostics being enabled: when both are off, we take no
@@ -83,6 +84,7 @@ pub(crate) async fn run_query(
                     let mut engine = Engine::new(&view, cache.as_ref())
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
                         .with_temp_beam_width(temp_beam_width)
+                        .with_fulltext_max_hits(fulltext_max_hits)
                         .with_params(params)
                         .with_max_rows(max_rows)
                         .with_max_intermediate(max_intermediate)

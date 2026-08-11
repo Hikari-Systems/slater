@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::Generation;
 
-/// Which entity a range index or vector index attaches to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Which entity a range, vector or full-text index attaches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Node,

@@ -161,6 +161,8 @@ pub struct AppConfig {
     pub query: QueryConfig,
     #[serde(default)]
     pub vector_query: VectorQueryConfig,
+    #[serde(default)]
+    pub fulltext: FulltextConfig,
     /// Cypher query run once at boot against every served graph, with its results
     /// discarded. Its only effect is to fault the blocks needed to answer it into
     /// the block (and vector) cache, so the first real client query of that shape
@@ -757,6 +759,40 @@ pub struct QueryConfig {
     /// live neighbour buffer to O(this) regardless of degree.
     #[serde(default = "default_adj_stream_chunk", deserialize_with = "de::usize")]
     pub adj_stream_chunk: usize,
+}
+
+/// `db.idx.fulltext.query*` tuning.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FulltextConfig {
+    /// Most hits one full-text call may return. `0` disables the cap.
+    ///
+    /// This exists because the procedure takes **no `k`**: graphiti passes only
+    /// `(label, query)`, unlike `db.idx.vector.queryNodes`, so nothing in the statement
+    /// bounds the result set. Without a cap a disjunction over common words would return
+    /// every matching document, and the candidate accumulation behind it is proportional
+    /// to that — which is the one place a full-text query can grow memory without a
+    /// `LIMIT` in sight.
+    ///
+    /// The default is generous rather than tight: graphiti asks for `2 * limit` results
+    /// and re-ranks, so a cap that bit at typical sizes would silently cost recall.
+    #[serde(default = "default_fulltext_max_hits", deserialize_with = "de::usize")]
+    pub max_hits: usize,
+}
+
+impl Default for FulltextConfig {
+    fn default() -> Self {
+        Self {
+            max_hits: default_fulltext_max_hits(),
+        }
+    }
+}
+
+/// See [`FulltextConfig::max_hits`].
+pub const DEFAULT_FULLTEXT_MAX_HITS: usize = 10_000;
+
+fn default_fulltext_max_hits() -> usize {
+    DEFAULT_FULLTEXT_MAX_HITS
 }
 
 #[derive(Debug, Clone, Deserialize)]

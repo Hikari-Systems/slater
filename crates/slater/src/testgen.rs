@@ -59,7 +59,18 @@ const LEVEL: i32 = 3;
 /// Returns `(data_dir, graph, uuid)`. Each `tag` gets its own root so tests can
 /// run (and tear down) in parallel.
 pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
-    write_basic_opt(tag, false)
+    write_basic_opt(tag, false, false)
+}
+
+/// Like [`write_basic`] but also carries a full-text index over `(:Person)` covering
+/// `name` and `city`, in that declaration order — so field 0 is `name` and field 1 is
+/// `city`, which is what a `@city:"…"` filter resolves against.
+///
+/// Only the three `Person` nodes are documents; `Acme`/`Globex` carry a label the index
+/// does not cover, so a docid is deliberately *not* a node id here — which is the point
+/// worth having a fixture for.
+pub fn write_basic_with_fulltext(tag: &str) -> (PathBuf, String, uuid::Uuid) {
+    write_basic_opt(tag, false, true)
 }
 
 /// Like [`write_basic`] but also emits the `prop_hist.blk` value→count histograms
@@ -67,10 +78,14 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
 /// fast path answers group-by / count(DISTINCT) from the histogram instead of
 /// walking the ISAM. Used by the histogram-on vs histogram-off parity test.
 pub fn write_basic_with_histograms(tag: &str) -> (PathBuf, String, uuid::Uuid) {
-    write_basic_opt(tag, true)
+    write_basic_opt(tag, true, false)
 }
 
-fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::Uuid) {
+fn write_basic_opt(
+    tag: &str,
+    with_histogram: bool,
+    with_fulltext: bool,
+) -> (PathBuf, String, uuid::Uuid) {
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0002);
     let graph = "people".to_string();
     let root = std::env::temp_dir().join(format!("slater_fixture_{}_{tag}", std::process::id()));
@@ -256,6 +271,65 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
     if with_histogram {
         inv_names.push("prop_hist.blk");
     }
+    // fulltext/node_Person.* — the three Person nodes, over (name, city).
+    let mut fulltext_indexes = Vec::new();
+    if with_fulltext {
+        use graph_format::fulltext::index::{write_fulltext_index, DocEntry, Posting};
+        use graph_format::fulltext::Analyzer;
+        let analyzer = Analyzer::new(&["the".to_string()]);
+        let rows: [(u64, &str, &str); 3] = [
+            (0, "Alice", "London"),
+            (1, "Bob", "London"),
+            (2, "Carol", "Paris"),
+        ];
+        let mut docs = Vec::new();
+        let mut postings = Vec::new();
+        for (doc, (entity, name, city)) in rows.iter().enumerate() {
+            let mut len = 0u32;
+            for (field, text) in [name, city].iter().enumerate() {
+                for term in analyzer.terms(text) {
+                    len += 1;
+                    postings.push(Posting {
+                        term,
+                        field: field as u32,
+                        doc: doc as u64,
+                        tf: 1,
+                    });
+                }
+            }
+            docs.push(DocEntry {
+                entity: *entity,
+                len,
+                endpoints: None,
+            });
+        }
+        postings.sort_by(|a, b| {
+            (a.term.as_str(), a.field, a.doc).cmp(&(b.term.as_str(), b.field, b.doc))
+        });
+        let stats = write_fulltext_index(
+            &dir,
+            "fulltext/node_Person",
+            docs.into_iter().map(Ok),
+            postings.into_iter().map(Ok),
+            BLOCK,
+            LEVEL,
+            &|_| None,
+        )
+        .unwrap();
+        for name in &stats.files {
+            inv_names.push(Box::leak(name.clone().into_boxed_str()));
+        }
+        fulltext_indexes.push(graph_format::manifest::FulltextIndexDesc {
+            name: "node_Person".into(),
+            entity: EntityKind::Node,
+            label_or_type: "Person".into(),
+            properties: vec!["name".into(), "city".into()],
+            stopwords: vec!["the".into()],
+            stemmer: None,
+            doc_count: stats.doc_count,
+            avg_doc_len: stats.avg_doc_len,
+        });
+    }
     for name in inv_names {
         add(name, &mut files, &mut block_sizes);
     }
@@ -267,7 +341,7 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
-        fulltext_indexes: Vec::new(),
+        fulltext_indexes,
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),

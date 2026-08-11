@@ -294,6 +294,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         fanout_pool: build_fanout_pool(cfg.query.max_fanout),
         beam_width: cfg.vector_query.beam_width as usize,
         temp_beam_width: cfg.vector_query.temp_beam_width as usize,
+        fulltext_max_hits: cfg.fulltext.max_hits,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
         use_selection: RwLock::new(HashMap::new()),
@@ -432,6 +433,7 @@ pub(crate) async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
     let vector_cache = ctx.vector_cache.clone();
     let beam_width = ctx.beam_width;
     let temp_beam_width = ctx.temp_beam_width;
+    let fulltext_max_hits = ctx.fulltext_max_hits;
     let max_rows = ctx.max_rows;
     let max_intermediate = ctx.max_intermediate;
     let max_scan = ctx.max_scan;
@@ -450,6 +452,7 @@ pub(crate) async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
             let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
                 .with_vector_cache(vector_cache.as_ref(), beam_width)
                 .with_temp_beam_width(temp_beam_width)
+                .with_fulltext_max_hits(fulltext_max_hits)
                 .with_max_rows(max_rows)
                 .with_max_intermediate(max_intermediate)
                 .with_max_scan(max_scan)

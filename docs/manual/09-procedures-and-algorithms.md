@@ -162,10 +162,41 @@ latency histogram. It is **gated**: it errors unless `loadTestDiagnostics=true`,
 which also prints a startup warning not to enable it on a production replica. See
 [13 Deployment](13-deployment.md) and [16 Performance tuning](16-performance-tuning.md).
 
+## Full-text search
+
+`db.idx.fulltext.queryNodes(label, query)` searches a full-text index declared at
+build time ([05 Building graphs](05-building-graphs.md)) and yields `node` and
+`score`; `db.idx.fulltext.queryRelationships` is the relationship form and yields
+`relationship` instead.
+
+```cypher
+CALL db.idx.fulltext.queryNodes('Entity', $query)
+  YIELD node, score
+  RETURN node.name, score ORDER BY score DESC LIMIT 10;
+```
+
+Three things to know:
+
+- **`score` is BM25 and orders DESCENDING** — larger is a better match. This is the
+  opposite of `db.idx.vector.queryNodes`, whose `score` is a *distance* ordered
+  ascending. The two procedures share a namespace and disagree on the convention.
+- **There is no `k` argument.** The result set is bounded by `fulltext.maxHits`
+  (default 10 000); use `LIMIT` to take fewer.
+- **The query language is small on purpose:** `(@field:"value"|"value") (term |
+  term)`. The filter half is required and contributes nothing to the score; the
+  term half is a disjunction and is what scores. Phrases, wildcards, negation and
+  ranges are **not** supported and are refused with an error rather than silently
+  matching nothing. A field filter's value is matched by its terms, not as an exact
+  phrase, so treat it as a narrowing filter rather than an equality predicate.
+
+Two current limits: a **relationship** index is declared but not yet built, so
+`queryRelationships` answers nothing; and a document written through the writable
+layer since the generation was built is not searchable until `CALL
+slater.consolidate()` rebuilds the index. Both are recall gaps — every hit returned
+is real and correctly scored.
+
 ## Not supported
 
-- **Full-text index procedures** (`db.idx.fulltext.*`) — not implemented; a `CALL`
-  is rejected.
 - **User-defined / APOC procedures** — there is no plugin mechanism.
 
 ## Next

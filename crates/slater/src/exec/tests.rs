@@ -11823,3 +11823,173 @@ fn the_count_walk_agrees_with_the_materialising_walk_on_a_live_delta() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── CALL db.idx.fulltext.queryNodes ──────────────────────────────────────────
+//
+// The fixture indexes `(:Person)` over `(name, city)`: Alice/London, Bob/London,
+// Carol/Paris. `Acme`/`Globex` are `:Company` and are not documents, which is what makes
+// a docid provably not a node id here.
+
+/// Run `q` against the full-text fixture.
+fn run_ft(root_tag: &str, q: &str) -> (std::path::PathBuf, QueryResult) {
+    let (root, graph, _) = testgen::write_basic_with_fulltext(root_tag);
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let engine = Engine::new(&gen, &cache);
+    let ast = parser::parse(q).unwrap();
+    let res = engine.run(&ast).unwrap();
+    (root, res)
+}
+
+#[test]
+fn fulltext_query_nodes_binds_the_matching_nodes() {
+    let (root, res) = run_ft(
+        "exec_ft_basic",
+        "CALL db.idx.fulltext.queryNodes('Person', ' (London)') \
+             YIELD node, score RETURN node.name AS name ORDER BY name",
+    );
+    assert_eq!(col0(&res), ["Alice", "Bob"], "both Londoners match");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The bound value is a real node, so ordinary property access and traversal work off it
+/// — that is what makes the procedure composable rather than a special case.
+#[test]
+fn a_fulltext_hit_is_an_ordinary_node() {
+    let (root, res) = run_ft(
+        "exec_ft_compose",
+        "CALL db.idx.fulltext.queryNodes('Person', ' (Alice)') YIELD node AS n \
+             MATCH (n)-[:KNOWS]->(m) RETURN m.name AS name ORDER BY name",
+    );
+    // Alice KNOWS both Bob (e0) and Carol (e4) in the fixture.
+    assert_eq!(
+        col0(&res),
+        ["Bob", "Carol"],
+        "a hit must traverse like any other node"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `score` is BM25 and **descends** — the opposite of the vector procedure's ascending
+/// distance. Graphiti's `ORDER BY score DESC` depends on it.
+#[test]
+fn fulltext_score_is_positive_and_orders_descending() {
+    let (root, res) = run_ft(
+        "exec_ft_score",
+        "CALL db.idx.fulltext.queryNodes('Person', ' (Alice | London)') \
+             YIELD node, score RETURN node.name AS name, score ORDER BY score DESC",
+    );
+    // Alice matches both terms, Bob only `london`, so Alice must come first.
+    assert_eq!(res.rows[0][0].to_display(), "Alice");
+    let scores: Vec<f64> = res
+        .rows
+        .iter()
+        .map(|r| match r[1] {
+            Val::Float(f) => f,
+            ref other => panic!("score should be a float, got {other:?}"),
+        })
+        .collect();
+    assert!(scores.iter().all(|s| *s > 0.0), "{scores:?}");
+    assert!(scores[0] > scores[1], "descending: {scores:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A field filter resolves against the index's *declared property order* — `city` is
+/// field 1 — and restricts without contributing to the score.
+#[test]
+fn a_field_filter_restricts_the_hits() {
+    let (root, res) = run_ft(
+        "exec_ft_filter",
+        "CALL db.idx.fulltext.queryNodes('Person', '(@city:\"Paris\") (Alice | Carol)') \
+             YIELD node RETURN node.name AS name ORDER BY name",
+    );
+    assert_eq!(
+        col0(&res),
+        ["Carol"],
+        "Alice matches the term but not the filter"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `YIELD … WHERE` filters the yielded rows, as it does for the vector procedure.
+#[test]
+fn fulltext_yield_where_filters_rows() {
+    let (root, res) = run_ft(
+        "exec_ft_where",
+        "CALL db.idx.fulltext.queryNodes('Person', ' (London)') \
+             YIELD node, score WHERE node.name = 'Bob' RETURN node.name AS name",
+    );
+    assert_eq!(col0(&res), ["Bob"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An absent term is an ordinary empty answer; a query naming an index the graph does not
+/// declare is an **error**, because answering "no results" would hide the misconfiguration.
+#[test]
+fn absent_terms_are_empty_but_an_undeclared_index_is_an_error() {
+    let (root, res) = run_ft(
+        "exec_ft_absent",
+        "CALL db.idx.fulltext.queryNodes('Person', ' (nobodywrotethis)') \
+             YIELD node RETURN node.name AS name",
+    );
+    assert!(res.rows.is_empty());
+
+    let (root2, graph, _) = testgen::write_basic_with_fulltext("exec_ft_undeclared");
+    let gen = Generation::open(&root2, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let engine = Engine::new(&gen, &cache);
+    let ast = parser::parse(
+        "CALL db.idx.fulltext.queryNodes('Company', ' (Acme)') YIELD node RETURN node",
+    )
+    .unwrap();
+    let err = engine
+        .run(&ast)
+        .expect_err("Company declares no full-text index");
+    assert!(format!("{err:#}").contains("no full-text index"), "{err:#}");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
+/// A docid is a rank among *documents*, not a node id: only the three `Person` nodes are
+/// indexed, so a hit must resolve through `.docs.blk` rather than be used directly. Carol
+/// is document 2 and node 2, but Paris matching only her would pass either way — so this
+/// asserts the identity that would break if docids were used as node ids.
+#[test]
+fn a_docid_is_resolved_to_its_node_id() {
+    let (root, res) = run_ft(
+        "exec_ft_docid",
+        "CALL db.idx.fulltext.queryNodes('Person', ' (Paris)') \
+             YIELD node RETURN id(node) AS id, node.name AS name",
+    );
+    assert_eq!(res.rows.len(), 1);
+    assert_eq!(res.rows[0][1].to_display(), "Carol");
+    assert_eq!(
+        res.rows[0][0].to_display(),
+        "2",
+        "the hit must carry Carol's node id"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Unsupported query syntax is refused, naming what is accepted — never mistaken for a
+/// query that matched nothing.
+#[test]
+fn unsupported_fulltext_syntax_is_refused_at_execution() {
+    let (root, graph, _) = testgen::write_basic_with_fulltext("exec_ft_bad_syntax");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let engine = Engine::new(&gen, &cache);
+    let ast =
+        parser::parse("CALL db.idx.fulltext.queryNodes('Person', 'Alice*') YIELD node RETURN node")
+            .unwrap();
+    let err = engine
+        .run(&ast)
+        .expect_err("bare/wildcard syntax must be refused");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("phrases, wildcards"), "{msg}");
+    assert!(
+        msg.contains("queryNodes"),
+        "the error should name the call: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

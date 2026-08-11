@@ -27,9 +27,10 @@
 
 use anyhow::Result;
 use graph_format::columns::PropsReader;
+use graph_format::fulltext::index::FulltextReader;
 use graph_format::ids::{Generation as GenId, Value};
 use graph_format::isam::IsamReader;
-use graph_format::manifest::Manifest;
+use graph_format::manifest::{EntityKind, Manifest};
 use graph_format::nodelabels::NodeLabelsReader;
 use graph_format::postings::EndpointPostingIter;
 use graph_format::topology::TopologyReader;
@@ -102,6 +103,9 @@ pub trait ReadView: Send + Sync {
     fn range_index(&self, name: &str) -> Option<&IsamReader>;
     fn property_histogram(&self, name: &str) -> Option<&[(Value, u64)]>;
     fn vamana_index(&self, label: &str, property: &str) -> Option<&VamanaIndex>;
+    /// The full-text index over `(entity, label)`. `None` covers both "not declared"
+    /// and "declared but its files were never written" — an empty index either way.
+    fn fulltext_index(&self, entity: EntityKind, label: &str) -> Option<&FulltextReader>;
 
     // ── Counts / marginals ──────────────────────────────────────────────────
     fn label_node_count(&self, label_id: u32) -> u64;
@@ -285,6 +289,9 @@ impl ReadView for Generation {
     }
     fn property_histogram(&self, name: &str) -> Option<&[(Value, u64)]> {
         Generation::property_histogram(self, name)
+    }
+    fn fulltext_index(&self, entity: EntityKind, label: &str) -> Option<&FulltextReader> {
+        Generation::fulltext_index(self, entity, label)
     }
     fn vamana_index(&self, label: &str, property: &str) -> Option<&VamanaIndex> {
         Generation::vamana_index(self, label, property)
@@ -745,6 +752,13 @@ impl ReadView for MergedView<'_> {
     }
     fn vamana_index(&self, label: &str, property: &str) -> Option<&VamanaIndex> {
         self.core.vamana_index(label, property)
+    }
+    /// Straight through to the core: full text has no delta arm yet, so a document
+    /// written since the generation was built is not searchable until a consolidation
+    /// rebuilds the index. A recall gap, not a correctness one — every hit this returns
+    /// is real and correctly scored.
+    fn fulltext_index(&self, entity: EntityKind, label: &str) -> Option<&FulltextReader> {
+        self.core.fulltext_index(entity, label)
     }
     fn label_node_count(&self, label_id: u32) -> u64 {
         self.core.label_node_count(label_id)
