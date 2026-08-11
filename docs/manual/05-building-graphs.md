@@ -209,12 +209,9 @@ A declaration whose label or relationship type appears nowhere in the dump build
 an empty index and warns on stderr: legal (it answers every query with nothing),
 but nearly always a misspelling.
 
-> Two current limits, both of which leave a declaration valid and simply empty:
-> the `db.idx.fulltext.query*` procedures are not implemented yet, so nothing can
-> search an index from Cypher; and a **relationship** index is declared but not yet
-> built (the edge emit is band-parallel and needs its own pass to assign document
-> ids). Node indexes are built and populated. Declarations of both kinds are carried
-> through `CALL slater.consolidate()`, so a graph built now keeps them.
+Declarations are carried through `CALL slater.consolidate()`, so a rebuilt graph
+keeps its indexes. Searching them is
+[`db.idx.fulltext.query*`](09-procedures-and-algorithms.md).
 
 ## Resume and diagnostics
 

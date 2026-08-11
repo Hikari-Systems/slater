@@ -189,11 +189,10 @@ Three things to know:
   matching nothing. A field filter's value is matched by its terms, not as an exact
   phrase, so treat it as a narrowing filter rather than an equality predicate.
 
-Two current limits: a **relationship** index is declared but not yet built, so
-`queryRelationships` answers nothing; and a document written through the writable
-layer since the generation was built is not searchable until `CALL
-slater.consolidate()` rebuilds the index. Both are recall gaps — every hit returned
-is real and correctly scored.
+One current limit: a document written through the writable layer since the
+generation was built is not searchable until `CALL slater.consolidate()` rebuilds
+the index. That is a recall gap, not a correctness one — every hit returned is real
+and correctly scored.
 
 ## Not supported
 

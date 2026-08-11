@@ -785,6 +785,7 @@ fn external_build_declares_fulltext_indexes() {
     assert_eq!(edge.label_or_type, "RELATES_TO");
     assert_eq!(edge.properties, ["name", "fact", "group_id"]);
     assert_eq!(edge.name, "edge_RELATES_TO");
+    assert_eq!(edge.doc_count, 1, "the one RELATES_TO edge carries text");
 
     // A manifest that declares no full-text index must not gain the key, or every
     // existing sealed MANIFEST in the estate stops verifying (see the manifest test
@@ -856,6 +857,40 @@ fn external_build_declares_fulltext_indexes() {
         1,
         "the group filter resolves against a field"
     );
+
+    // ── the relationship index is populated, and carries its endpoints ──
+    for suffix in [".ftd", ".ftm.blk", ".post.blk", ".docs.blk"] {
+        let name = format!("fulltext/edge_RELATES_TO{suffix}");
+        assert!(
+            m.files.iter().any(|f| f.name == name),
+            "{name} must be in the generation inventory"
+        );
+    }
+    let er = FulltextReader::open(&gen_dir, "fulltext/edge_RELATES_TO", true, &no_cipher).unwrap();
+    assert_eq!(er.doc_count(), 1);
+    // "knows" is in the edge's `name`, "bob" in its `fact` — two fields of one document.
+    for term in ["knows", "bob"] {
+        let hits = search(&er, &q(term), edge.avg_doc_len, Bm25Params::default(), 10).unwrap();
+        assert_eq!(hits.len(), 1, "one match for {term:?}: {hits:?}");
+        let doc = er.doc(hits[0].doc).unwrap();
+        // The endpoints ride the document record so a hit can be yielded as a bound
+        // relationship without an adjacency read. Alice is the source, Bob the target.
+        let (src, dst, reltype) = doc
+            .endpoints
+            .expect("a relationship index stores endpoints");
+        assert_eq!(
+            (
+                entity_name(&gen_dir, &m, src),
+                entity_name(&gen_dir, &m, dst)
+            ),
+            ("Alice".to_string(), "Bob".to_string()),
+            "the stored endpoints must be the real edge's, in stored direction"
+        );
+        assert_eq!(
+            m.reltypes.get(reltype as usize).map(String::as_str),
+            Some("RELATES_TO")
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&work);
 }

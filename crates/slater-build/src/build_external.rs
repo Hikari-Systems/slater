@@ -2010,6 +2010,35 @@ fn build_inner(
         }
     };
     let range_mx = Mutex::new(range_sorters);
+
+    // Relationship full-text indexes: one budgeted sorter each, fed by the band workers
+    // and drained after the emit (where the ascending `final_edge_id` order that makes a
+    // docid meaningful finally exists).
+    let ft_edge_stmts: Vec<&FulltextIndexStmt> = fulltext_stmts
+        .iter()
+        .filter(|f| f.entity == Entity::Edge)
+        .collect();
+    let mut ft_edge_specs: Vec<FulltextEdgeSpec> = Vec::new();
+    let mut ft_edge_sorters: Vec<ExtSorter<FulltextEdgeDoc>> = Vec::new();
+    let ft_edge_want = if ft_edge_stmts.is_empty() {
+        0
+    } else {
+        (mem.total() / 8 / ft_edge_stmts.len()).max(FULLTEXT_SORT_FLOOR)
+    };
+    for fi in &ft_edge_stmts {
+        ft_edge_specs.push(FulltextEdgeSpec {
+            idx: ft_edge_sorters.len(),
+            reltype_id: reltypes.get(&fi.label_or_type),
+            key_ids: fi.properties.iter().map(|p| keys.get(p)).collect(),
+            analyzer: Analyzer::new(&fi.stopwords),
+        });
+        ft_edge_sorters.push(ExtSorter::<FulltextEdgeDoc>::new(
+            scratch_dir,
+            mem.reserve_now("full-text edge sorter", ft_edge_want, FULLTEXT_SORT_FLOOR)?,
+            opts.zstd_level,
+        )?);
+    }
+    let ft_edge_mx = Mutex::new(ft_edge_sorters);
     let rev_spill = BandSpill::new(nbands, |b| band_path(scratch_dir, pid, "rev_route", b))?;
 
     // Everything the long-lived sinks left goes to the band workers, re-lent as a
@@ -2057,6 +2086,8 @@ fn build_inner(
         let fwd_ctx = ForwardEmitCtx {
             band,
             edge_range: &edge_range,
+            ft_edge: &ft_edge_specs,
+            ft_sorters: &ft_edge_mx,
             posts: &posting_sinks,
             range_sorters: &range_mx,
             rev_spill: &rev_spill,
@@ -2336,6 +2367,62 @@ fn build_inner(
     let emit_ft_g = diag.phase("emit.fulltext");
     diag.set_op("write full-text indexes", "indexes", ft_state.len() as u64);
     let mut ft_built: BTreeMap<String, (u64, f32)> = BTreeMap::new();
+
+    // Relationship indexes first: drain each edge sorter in ascending `final_edge_id`
+    // order — the order the band-parallel emit could not produce — assigning a dense
+    // docid as we go, and fanning each document's carried terms out into the posting
+    // stream keyed on that docid.
+    for (spec_stmt, sorter) in ft_edge_stmts.iter().zip(ft_edge_mx.into_inner().unwrap()) {
+        let stem = format!("fulltext/edge_{}", spec_stmt.label_or_type);
+        diag.set_op_detail(&stem);
+        let mut docs =
+            DocWriter::create(tmp_dir, &stem, opts.block_size, opts.zstd_level, &|name| {
+                file_cipher(&cipher, name)
+            })?;
+        let mut posts = ExtSorter::<FulltextEntry>::new(
+            scratch_dir,
+            mem.reserve_now("full-text edge postings", ft_edge_want, FULLTEXT_SORT_FLOOR)?,
+            opts.zstd_level,
+        )?;
+        for rec in sorter.sorted()? {
+            let d = rec?;
+            let doc = docs.push(&DocEntry {
+                entity: d.edge,
+                len: d.len,
+                endpoints: Some((d.src, d.dst, d.reltype)),
+            })?;
+            for (field, term, tf) in d.terms {
+                posts.push(FulltextEntry {
+                    term,
+                    field,
+                    doc,
+                    tf,
+                })?;
+            }
+        }
+        let (doc_count, avg_doc_len) = docs.finish()?;
+        write_fulltext_postings(
+            tmp_dir,
+            &stem,
+            posts.sorted()?.map(|r| {
+                r.map(|e| Posting {
+                    term: e.term,
+                    field: e.field,
+                    doc: e.doc,
+                    tf: e.tf,
+                })
+            }),
+            opts.block_size,
+            opts.zstd_level,
+            &|name| file_cipher(&cipher, name),
+        )?;
+        for name in ft_file_names(&stem) {
+            block_sizes.insert(name.clone(), opts.block_size as u32);
+            fulltext_files.push(name);
+        }
+        ft_built.insert(stem, (doc_count, avg_doc_len));
+    }
+
     for st in ft_state {
         diag.set_op_detail(&st.stem);
         let (doc_count, avg_doc_len) = st.docs.finish()?;
@@ -2388,15 +2475,11 @@ fn build_inner(
                 Entity::Node => format!("node_{}", fi.label_or_type),
                 Entity::Edge => format!("edge_{}", fi.label_or_type),
             };
-            // A relationship index has no files yet — the edge scan is band-parallel and
-            // does not visit edges in ascending final order, so assigning dense docids
-            // there needs its own pass. Until then it is declared, empty, and answers
-            // nothing, exactly like a declaration whose label matched no entity.
             let (doc_count, avg_doc_len) = ft_built
                 .get(&format!("fulltext/{name}"))
                 .copied()
                 .unwrap_or((0, 0.0));
-            if known && doc_count == 0 && fi.entity == Entity::Node {
+            if known && doc_count == 0 {
                 eprintln!(
                     "warning: full-text index on {kind} '{}' matched no text — every query \
                      over it will return nothing. Check the declared property names.",
@@ -3015,6 +3098,127 @@ impl SortRecord for FulltextEntry {
     }
 }
 
+/// One relationship's document, carried whole to the drain that assigns docids.
+///
+/// The terms ride *inside* the record rather than going straight to the postings sorter,
+/// and that is the whole trick. The edge emit is band-parallel, so it does not visit edges
+/// in ascending `final_edge_id` order — but a docid is a rank in that order. Sorting these
+/// by edge id and assigning docids at the drain reproduces the node path's property: the
+/// docids come out dense and ascending, and no `edge id -> docid` map is ever built.
+///
+/// Pushing postings directly from the band worker would key them on `final_edge_id`, and
+/// translating those to docids afterwards is exactly the map this avoids.
+struct FulltextEdgeDoc {
+    edge: u64,
+    src: u64,
+    dst: u64,
+    reltype: u32,
+    len: u32,
+    /// `(field, term, tf)`, ascending — the order the postings need within one document.
+    terms: Vec<(u32, String, u32)>,
+}
+
+impl SortRecord for FulltextEdgeDoc {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        write_uvarint(buf, self.edge);
+        write_uvarint(buf, self.src);
+        write_uvarint(buf, self.dst);
+        write_uvarint(buf, self.reltype as u64);
+        write_uvarint(buf, self.len as u64);
+        write_uvarint(buf, self.terms.len() as u64);
+        for (field, term, tf) in &self.terms {
+            write_uvarint(buf, *field as u64);
+            write_uvarint(buf, term.len() as u64);
+            buf.extend_from_slice(term.as_bytes());
+            write_uvarint(buf, *tf as u64);
+        }
+    }
+    fn decode(r: &mut &[u8]) -> Result<Self> {
+        let edge = read_uvarint(r)?;
+        let src = read_uvarint(r)?;
+        let dst = read_uvarint(r)?;
+        let reltype = read_uvarint(r)? as u32;
+        let len = read_uvarint(r)? as u32;
+        let n = read_uvarint(r)? as usize;
+        let mut terms = Vec::with_capacity(n);
+        for _ in 0..n {
+            let field = read_uvarint(r)? as u32;
+            let tl = read_uvarint(r)? as usize;
+            if r.len() < tl {
+                bail!("full-text edge document has a truncated term");
+            }
+            let term = std::str::from_utf8(&r[..tl])
+                .context("full-text edge document term is not UTF-8")?
+                .to_string();
+            *r = &r[tl..];
+            terms.push((field, term, read_uvarint(r)? as u32));
+        }
+        Ok(FulltextEdgeDoc {
+            edge,
+            src,
+            dst,
+            reltype,
+            len,
+            terms,
+        })
+    }
+    fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        self.edge.cmp(&other.edge)
+    }
+    fn size_hint(&self) -> usize {
+        40 + self
+            .terms
+            .iter()
+            .map(|(_, t, _)| t.len() + 20)
+            .sum::<usize>()
+    }
+}
+
+/// What a band worker needs to gather one declared relationship full-text index.
+struct FulltextEdgeSpec {
+    idx: usize,
+    reltype_id: Option<u32>,
+    key_ids: Vec<Option<u32>>,
+    analyzer: Analyzer,
+}
+
+/// Analyze one relationship's declared properties into a document, or `None` when it
+/// carries the wrong type or no indexable text at all — an entity with nothing to match
+/// must not take a docid, or it drags `avgDocLen` down and dilutes every real document's
+/// length normalisation.
+fn edge_fulltext_doc(
+    spec: &FulltextEdgeSpec,
+    props_blob: &[u8],
+    edge: u64,
+    src: u64,
+    dst: u64,
+    reltype: u32,
+) -> Result<Option<FulltextEdgeDoc>> {
+    let mut counts: BTreeMap<(u32, String), u32> = BTreeMap::new();
+    let mut len = 0u32;
+    for (field, key) in spec.key_ids.iter().enumerate() {
+        let Some(kid) = key else { continue };
+        let Some(Value::Str(text)) = extract_value(props_blob, *kid)? else {
+            continue;
+        };
+        for term in spec.analyzer.terms(&text) {
+            *counts.entry((field as u32, term)).or_insert(0) += 1;
+            len += 1;
+        }
+    }
+    if counts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(FulltextEdgeDoc {
+        edge,
+        src,
+        dst,
+        reltype,
+        len,
+        terms: counts.into_iter().map(|((f, t), tf)| (f, t, tf)).collect(),
+    }))
+}
+
 /// What the node scan needs to gather one declared full-text index.
 struct FulltextSpec {
     /// Position in the parallel `ft_state` vector.
@@ -3133,6 +3337,11 @@ struct ForwardEmitCtx<'a> {
     /// Band width in nodes — an edge's reverse record routes to band `final_dst / band`.
     band: u64,
     edge_range: &'a [EdgeRangeSpec],
+    /// Declared relationship full-text indexes, and the per-index sorters their documents
+    /// go to. Shared behind a `Mutex` and fed in batches exactly like `range_sorters` —
+    /// the lock is taken once per band, not once per edge.
+    ft_edge: &'a [FulltextEdgeSpec],
+    ft_sorters: &'a Mutex<Vec<ExtSorter<FulltextEdgeDoc>>>,
     posts: &'a PostingSinks,
     range_sorters: &'a Mutex<Vec<ExtSorter<RangeEntry>>>,
     rev_spill: &'a BandSpill,
@@ -3229,6 +3438,7 @@ fn emit_forward_band(
     let mut src_batch: Vec<RelEndpoint> = Vec::with_capacity(batch_cap);
     let mut tgt_batch: Vec<RelEndpoint> = Vec::with_capacity(batch_cap);
     let mut range_batch: Vec<(usize, RangeEntry)> = Vec::new();
+    let mut ft_batch: Vec<(usize, FulltextEdgeDoc)> = Vec::new();
 
     let flush_posts =
         |src_batch: &mut Vec<RelEndpoint>, tgt_batch: &mut Vec<RelEndpoint>| -> Result<()> {
@@ -3295,6 +3505,20 @@ fn emit_forward_band(
                 }
             }
         }
+        for spec in fwd.ft_edge {
+            if spec.reltype_id == Some(ef.reltype) {
+                if let Some(doc) = edge_fulltext_doc(
+                    spec,
+                    &ef.props_blob,
+                    final_edge_id,
+                    ef.final_src,
+                    ef.final_dst,
+                    ef.reltype,
+                )? {
+                    ft_batch.push((spec.idx, doc));
+                }
+            }
+        }
         rev_batch.push(
             (ef.final_dst / fwd.band) as usize,
             &EdgeRev {
@@ -3314,6 +3538,12 @@ fn emit_forward_band(
         let mut g = fwd.range_sorters.lock().unwrap();
         for (idx, re) in range_batch {
             g[idx].push(re)?;
+        }
+    }
+    if !ft_batch.is_empty() {
+        let mut g = fwd.ft_sorters.lock().unwrap();
+        for (idx, doc) in ft_batch {
+            g[idx].push(doc)?;
         }
     }
     csr.finish()?;
