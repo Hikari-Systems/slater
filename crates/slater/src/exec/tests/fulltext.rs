@@ -453,3 +453,164 @@ fn a_relationship_to_a_deleted_node_stops_matching() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── the relationship overlay arm ─────────────────────────────────────────────
+//
+// The built index covers the core generation; edges written or edited since are served
+// by the same overlay scan the node arm uses. These pin the three things that can go
+// wrong, and they are the edge twins of the node tests above.
+
+/// A relationship written through the delta is searchable immediately. Before the edge
+/// overlay existed this returned only the three core edges, so a fact added and searched
+/// in one session was simply not found.
+#[test]
+fn a_delta_born_relationship_is_searchable_before_consolidation() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_rel_born",
+        |mem| {
+            // Carol -KNOWS-> Alice: a pair the core has no KNOWS edge for, so this is
+            // born rather than a patch. It takes the first synthetic edge id, 5.
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Carol".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                Some(2),
+                Some(0),
+                [("fact".to_string(), Value::Str("delta shared".into()))],
+            );
+        },
+        FT_KNOWS_SHARED,
+    );
+    assert_eq!(
+        ft_edge_ids(&res),
+        [0, 1, 4, 5],
+        "the born edge must join the three core ones"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An edited relationship is scored from its *current* text, never from the stale copy
+/// the built index still holds. The core index says edge 0's fact is `alpha shared`; the
+/// delta says it is `omega`. Only the delta is true.
+#[test]
+fn an_edited_relationship_is_scored_from_its_current_text() {
+    let edit = |mem: &mut FtMemtable| {
+        mem.patch_core_edge(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+            0, // the core edge id
+            [("fact".to_string(), Value::Str("omega".into()))],
+        );
+    };
+
+    // The term it *used* to carry must no longer find it — the core arm has to have
+    // suppressed it, not merely been outvoted by the overlay.
+    let (root, stale) = run_ft_delta(
+        "exec_ft_rel_edit_stale",
+        edit,
+        "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (alpha)') \
+         YIELD relationship AS r RETURN id(r) AS eid ORDER BY eid",
+    );
+    assert!(
+        ft_edge_ids(&stale).is_empty(),
+        "the edited edge must not answer to the text it no longer carries"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Its new term must find it, which is what proves the overlay scored it at all.
+    let (root2, fresh) = run_ft_delta(
+        "exec_ft_rel_edit_fresh",
+        edit,
+        "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (omega)') \
+         YIELD relationship AS r RETURN id(r) AS eid ORDER BY eid",
+    );
+    assert_eq!(ft_edge_ids(&fresh), [0], "the new text must match");
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
+/// An edge query's corpus statistics must come from the **edge** index.
+///
+/// This is the one failure in this area that is silent rather than loud: asking the node
+/// index for an edge query's document frequencies returns plausible weights from the
+/// wrong corpus, and nothing looks broken — the ranking is just wrong.
+///
+/// So it is asserted through scores rather than through membership, and the terms are
+/// chosen so that the *wrong* lookup is observable. Two born edges carry one term each,
+/// of equal length: `alpha`, which one core KNOWS document carries (edge df = 1), and
+/// `zzq`, which nothing has ever carried (df = 0). A term already seen must be judged
+/// less rare, so `alpha` has to score **strictly lower** than `zzq`.
+///
+/// `shared` would have been the obvious choice and is the wrong one: it is carried by
+/// *every* core document, which drives its idf non-positive, and the overlay arm drops
+/// a document that scores <= 0. The edge simply vanished from the result.
+///
+/// The first version of this test used `london` — a term the *node* index knows — and
+/// asserted the two scored equally. It had no teeth: `fulltext_index(Node, "KNOWS")`
+/// finds no index at all, so the wrong lookup returns `df = 0` too and the assertion held
+/// either way. Verified by mutation this time: forcing the kind back to `Node` fails
+/// this.
+#[test]
+fn an_edge_query_scores_against_the_edge_index_not_the_node_index() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_rel_idf",
+        |mem| {
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Carol".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                Some(2),
+                Some(0),
+                [("fact".to_string(), Value::Str("alpha".into()))],
+            );
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Bob".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                Some(1),
+                Some(0),
+                [("fact".to_string(), Value::Str("zzq".into()))],
+            );
+        },
+        "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (alpha | zzq)') \
+         YIELD relationship AS r, score RETURN id(r) AS eid, score ORDER BY eid",
+    );
+    // `alpha` matches a core document too, so select the two born edges by id rather
+    // than by position: 5 carries `alpha`, 6 carries `zzq`.
+    let score_of = |eid: i64| -> f64 {
+        res.rows
+            .iter()
+            .find(|r| matches!(&r[0], Val::Int(i) if *i == eid))
+            .map(|r| match &r[1] {
+                Val::Float(f) => *f,
+                other => panic!("expected a score, got {other:?}"),
+            })
+            .unwrap_or_else(|| panic!("edge {eid} did not match"))
+    };
+    let (common, unseen) = (score_of(5), score_of(6));
+    assert!(
+        common < unseen,
+        "`alpha` is already carried by a core document and must be judged less rare than \
+         `zzq`, which nothing carries; equal scores mean the document frequencies came \
+         from the wrong corpus: alpha={common}, zzq={unseen}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

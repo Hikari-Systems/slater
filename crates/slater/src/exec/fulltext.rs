@@ -22,18 +22,17 @@
 //! so there is no new delta format, no WAL change and no index data through consolidation
 //! — only the declaration.
 //!
-//! The candidate set is `delta.node_dense_ids() ∪ every segment's node_ids()`, bounded by
-//! the delta and segment sizes rather than the graph's. Those same ids are **suppressed**
-//! in the core arm, so a document whose text changed is scored once, from its current
-//! text, rather than twice or from a stale copy.
+//! The candidate set is `delta.node_dense_ids() ∪ every segment's node_ids()` for nodes,
+//! and the edge twin of that for relationships, bounded by the delta and segment sizes
+//! rather than the graph's. Those same ids are **suppressed** in the core arm, so a
+//! document whose text changed is scored once, from its current text, rather than twice
+//! or from a stale copy.
 //!
-//! **The overlay arm is nodes-only; suppression is not.** A relationship index has no
-//! overlay yet, so it lags on facts written since the build — a stated limit, closing at
-//! the next consolidation. It does *not* lag on deleted ones: `fulltext_dead` asks the
-//! same three questions of an edge that the traversal overlay asks, so a fact the graph
-//! no longer holds stops matching immediately. Recall and correctness are deliberately
-//! not traded off together here, because an index that returns deleted facts is worse
-//! than one that is merely behind.
+//! **Relationships differ in one way only.** An edge id cannot be resolved to its
+//! endpoints — the core CSR is keyed by node — and a hit must be yielded as a bound
+//! relationship, which carries them. So the edge candidate set is gathered as a map of
+//! `id -> (src, dst, reltype)` rather than a bare id set, which is the same reason
+//! `.docs.blk` stores endpoints for a core document. Everything downstream is shared.
 //!
 //! # The approximation, stated rather than hidden
 //!
@@ -84,18 +83,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// A segment already enumerates the rows it holds (`SegmentReader::node_ids`), so this
     /// needs no per-segment sidecar of its own — the touched set the design called for was
     /// already on disk.
-    ///
-    /// **Relationships have no overlay arm.** A relationship's text can only reach the
-    /// delta through an edge write, and the writable layer's edge rows carry patches
-    /// rather than a scannable identity set; more to the point, graphiti's edge search
-    /// reads facts that are written once with the edge. So an edge index is served from
-    /// the core alone, and its recall gap closes at consolidation. Returning an empty set
-    /// here is what makes that explicit rather than accidental.
-    fn fulltext_overlay_ids(&self, relationships: bool) -> Result<HashSet<u64>> {
+    fn fulltext_overlay_ids(&self) -> Result<HashSet<u64>> {
         let mut ids: HashSet<u64> = HashSet::new();
-        if relationships {
-            return Ok(ids);
-        }
         ids.extend(self.gen.delta().node_dense_ids());
         let stack = self.gen.core_stack();
         if !stack.is_singleton() {
@@ -104,6 +93,66 @@ impl<'g, V: ReadView> Engine<'g, V> {
             }
         }
         Ok(ids)
+    }
+
+    /// The edge twin: `edge id -> (src, dst, reltype)` for every edge a level above the
+    /// core generation has touched.
+    ///
+    /// Endpoints are gathered here rather than looked up per hit, for the same reason
+    /// `.docs.blk` stores them: an edge id alone cannot be resolved to its endpoints
+    /// without an adjacency read, and the core CSR is keyed by node, not by edge. Every
+    /// source below already knows them, so collecting once per statement costs nothing
+    /// extra and makes the per-hit path a map lookup.
+    ///
+    /// Three sources, mirroring the three ways an edge can sit above the core:
+    ///
+    /// - a **sealed segment** row, which carries `src`/`dst`/`reltype` directly;
+    /// - a **patched core edge**, whose endpoints the delta records when it resolves the
+    ///   patch (they cannot be recovered from the core by id);
+    /// - a **delta-born** edge, walked as `adj_out_nodes x out_edges` — the only
+    ///   enumeration that yields an edge id beside its endpoints in one pass.
+    ///
+    /// Later sources win, which is the level order: a born edge cannot collide with a
+    /// core id, but a core edge patched in the delta must beat the same edge's segment
+    /// row.
+    fn fulltext_edge_overlay(&self) -> Result<HashMap<u64, (u64, u64, u32)>> {
+        let mut m: HashMap<u64, (u64, u64, u32)> = HashMap::new();
+        let stack = self.gen.core_stack();
+        if !stack.is_singleton() {
+            for seg in stack.segments() {
+                for id in seg.reader.edge_ids() {
+                    let Some(row) = stack.resolve_edge_row(id)? else {
+                        continue;
+                    };
+                    if let Some(rt) = self.gen.reltype_id(&row.reltype) {
+                        m.insert(id, (row.src, row.dst, rt));
+                    }
+                }
+            }
+        }
+        let delta = self.gen.delta();
+        if delta.is_empty() {
+            return Ok(m);
+        }
+        for (id, src, dst, rt_name) in delta.core_patched_edges() {
+            if let Some(rt) = self.gen.reltype_id(&rt_name) {
+                m.insert(id, (src, dst, rt));
+            }
+        }
+        for src in delta.adj_out_nodes() {
+            for e in delta.out_edges(src) {
+                // A tombstone-only entry carries no edge id and suppresses rather than
+                // contributes; `fulltext_dead` is what applies it.
+                let Some(eid) = e.edge_id else { continue };
+                if e.tombstoned {
+                    continue;
+                }
+                if let Some(rt) = self.gen.reltype_id(&e.reltype) {
+                    m.insert(eid, (src, e.other, rt));
+                }
+            }
+        }
+        Ok(m)
     }
 
     /// Whether a **node** has been deleted, in the delta or in a sealed segment. The
@@ -120,12 +169,6 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// Takes the whole document record rather than an id because a **relationship**
     /// cannot be checked without its endpoints, and the record already carries them —
     /// the caller read it to score the hit.
-    ///
-    /// A relationship index is served from the core generation alone, which costs recall
-    /// on facts written since the build. That is a stated limit. It must not also cost
-    /// *correctness* on deleted ones: an index that keeps returning a fact the graph no
-    /// longer holds is worse than one that is merely behind. This is what makes the edge
-    /// arm honest about deletion while its overlay arm does not yet exist.
     ///
     /// Deletion reaches an edge three ways, and all three are asked here:
     ///
@@ -183,14 +226,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// scanned `.docs.blk` from the top to re-find a record the caller had just held,
     /// which made every relationship query O(hits x corpus).
     ///
-    /// `len` is 0 because nothing downstream reads it, and `endpoints` is `None` because
-    /// the overlay arm is nodes-only; when it grows an edge arm, this is where a born
-    /// edge's endpoints come from.
-    fn fulltext_doc_entry(&self, _fc: &FulltextCallClause, entity: u64) -> Result<DocEntry> {
+    /// `len` is 0 because nothing downstream reads it. `endpoints` come from the edge
+    /// overlay map, which gathered them when it enumerated the candidates — a
+    /// relationship must be yielded with its endpoints, and an edge id alone cannot be
+    /// resolved to them.
+    fn fulltext_doc_entry(
+        &self,
+        entity: u64,
+        edges: &HashMap<u64, (u64, u64, u32)>,
+    ) -> Result<DocEntry> {
         Ok(DocEntry {
             entity,
             len: 0,
-            endpoints: None,
+            endpoints: edges.get(&entity).copied(),
         })
     }
 
@@ -203,13 +251,21 @@ impl<'g, V: ReadView> Engine<'g, V> {
         analyzer: &Analyzer,
         q: &FulltextQuery,
         overlay: &HashSet<u64>,
+        edges: &HashMap<u64, (u64, u64, u32)>,
     ) -> Result<Vec<(u64, f64)>> {
         let mut out = Vec::new();
         if q.terms.is_empty() || overlay.is_empty() {
             return Ok(out);
         }
-        let Some(label_id) = self.gen.label_id(&fc.label) else {
-            // The label is not in the symbol table at all, so nothing can carry it.
+        // A node index selects its documents by label, an edge index by relationship
+        // type. Both are one symbol-table lookup; neither being present means nothing in
+        // the graph can carry it, so there is nothing to score.
+        let want_symbol = if fc.relationships {
+            self.gen.reltype_id(&fc.label)
+        } else {
+            self.gen.label_id(&fc.label)
+        };
+        let Some(want_symbol) = want_symbol else {
             return Ok(out);
         };
         // `doc_count` is the core's `N`. A generation built before anything was written
@@ -221,11 +277,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
         ids.sort_unstable();
         for id in ids {
             self.check_deadline()?;
-            if self.fulltext_node_dead(id)? {
-                continue;
-            }
-            if !self.node_label_ids(id)?.contains(&label_id) {
-                continue;
+            if fc.relationships {
+                // Suppression asks the same three questions of an overlay edge that it
+                // asks of a core one, through the same record shape.
+                let doc = self.fulltext_doc_entry(id, edges)?;
+                if doc.endpoints.is_none() || self.fulltext_dead(&doc, true)? {
+                    continue;
+                }
+                if doc.endpoints.map(|(_, _, rt)| rt) != Some(want_symbol) {
+                    continue;
+                }
+            } else {
+                if self.fulltext_node_dead(id)? {
+                    continue;
+                }
+                if !self.node_label_ids(id)?.contains(&want_symbol) {
+                    continue;
+                }
             }
             // Analyze the entity's *current* text, field by field, exactly as the builder
             // did — same analyzer, same declaration order, so a term found here is the
@@ -235,7 +303,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 vec![HashMap::new(); desc.properties.len()];
             let mut len = 0u32;
             for (field, prop) in desc.properties.iter().enumerate() {
-                let Val::Str(text) = self.node_prop(id, prop)? else {
+                let value = if fc.relationships {
+                    self.edge_prop(id, prop)?
+                } else {
+                    self.node_prop(id, prop)?
+                };
+                let Val::Str(text) = value else {
                     continue;
                 };
                 for term in analyzer.terms(&text) {
@@ -267,9 +340,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 // The term's *core* document frequency — the reconciliation that keeps
                 // both arms on one scale. A term the core has never seen has `df = 0`,
                 // which scores it as maximally rare, and that is the honest answer.
+                //
+                // The entity kind has to follow the call. Asking the *node* index for an
+                // edge query's statistics would not fail — it would return plausible
+                // weights from the wrong corpus, and the ranking would simply be wrong
+                // with nothing to show for it.
+                let kind = if fc.relationships {
+                    EntityKind::Edge
+                } else {
+                    EntityKind::Node
+                };
                 let df = self
                     .gen
-                    .fulltext_index(graph_format::manifest::EntityKind::Node, &fc.label)
+                    .fulltext_index(kind, &fc.label)
                     .map(|r| -> Result<u64> {
                         Ok(r.term_metas(term)?.first().map_or(0, |m| m.doc_df))
                     })
@@ -346,7 +429,18 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // Every entity some level above the built index has touched. Computed once per
         // statement — it does not vary by row — and bounded by the delta and segment
         // sizes, never by the graph's.
-        let overlay = self.fulltext_overlay_ids(fc.relationships)?;
+        // For a relationship call the candidate set comes with its endpoints attached;
+        // for a node call there are none to attach.
+        let edges = if fc.relationships {
+            self.fulltext_edge_overlay()?
+        } else {
+            HashMap::new()
+        };
+        let overlay: HashSet<u64> = if fc.relationships {
+            edges.keys().copied().collect()
+        } else {
+            self.fulltext_overlay_ids()?
+        };
 
         let mut out_rows = Vec::new();
         for row in &table.rows {
@@ -391,7 +485,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // An overlay document is in no `.docs.blk`, so it brings no record; the
             // projection synthesises one.
             scored.extend(
-                self.fulltext_overlay_hits(fc, desc, &analyzer, &q, &overlay)?
+                self.fulltext_overlay_hits(fc, desc, &analyzer, &q, &overlay, &edges)?
                     .into_iter()
                     .map(|(e, s)| (e, s, None)),
             );
@@ -416,7 +510,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let hit = Hit { doc: 0, score };
                 let doc = match carried {
                     Some(d) => d,
-                    None => self.fulltext_doc_entry(fc, entity)?,
+                    None => self.fulltext_doc_entry(entity, &edges)?,
                 };
                 let mut r = row.clone();
                 for bound in &new_vars {

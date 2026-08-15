@@ -2881,6 +2881,50 @@ impl DeltaSnapshot {
         ids
     }
 
+    /// Every dense edge id any level carries a delta for — born ids and patched core edge
+    /// ids alike — sorted and de-duplicated. The edge twin of [`Self::node_dense_ids`],
+    /// and bounded the same way: by the delta's size, not the graph's.
+    ///
+    /// De-duplication is not cosmetic. One core edge can be patched in several levels,
+    /// and a caller that scores per id would otherwise score it once per level.
+    pub fn edge_dense_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .levels_oldest_first()
+            .flat_map(|l| l.edge_ids())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Every source node with outgoing delta edges, across all levels — the enumeration
+    /// that turns [`Self::out_edges`] into a walk of every born edge. Sorted and
+    /// de-duplicated.
+    pub fn adj_out_nodes(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .levels_oldest_first()
+            .flat_map(|l| l.adj_out_nodes())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// `(core edge id, src dense, dst dense, reltype)` for every in-place core-edge
+    /// property patch across all levels. A newer level's entry wins, which is why this
+    /// folds oldest-first into a map rather than concatenating.
+    pub fn core_patched_edges(&self) -> Vec<(u64, u64, u64, String)> {
+        let mut acc: BTreeMap<u64, (u64, u64, String)> = BTreeMap::new();
+        for level in self.levels_oldest_first() {
+            for (id, src, dst, rt) in level.core_patched_edges() {
+                acc.insert(id, (src, dst, rt));
+            }
+        }
+        acc.into_iter()
+            .map(|(id, (src, dst, rt))| (id, src, dst, rt))
+            .collect()
+    }
+
     /// Resolve a node delta by current-core dense id, folded newest-wins across all
     /// levels (Phase 4c). A *core* dense id's patches may be split across levels — they
     /// merge per-property (newer wins), a tombstone clears+deletes and a newer upsert
