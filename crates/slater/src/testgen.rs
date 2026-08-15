@@ -329,6 +329,65 @@ fn write_basic_opt(
             doc_count: stats.doc_count,
             avg_doc_len: stats.avg_doc_len,
         });
+
+        // fulltext/rel_KNOWS.* — the three KNOWS edges (e0 0->1, e1 1->2, e4 0->2) over
+        // (fact). A *relationship* index, so its documents carry endpoints; the node index
+        // above cannot exercise that half of the reader at all.
+        //
+        // Every document shares the term `shared` and carries one term of its own, so a
+        // query can address exactly one edge or all three — which is what a suppression
+        // test needs (drop one, the other two must survive).
+        let rel_rows: [(u64, u64, u64, &str); 3] = [
+            (0, 0, 1, "alpha shared"),
+            (1, 1, 2, "beta shared"),
+            (4, 0, 2, "gamma shared"),
+        ];
+        let mut rel_docs = Vec::new();
+        let mut rel_postings = Vec::new();
+        for (doc, (entity, src, dst, fact)) in rel_rows.iter().enumerate() {
+            let mut len = 0u32;
+            for term in analyzer.terms(fact) {
+                len += 1;
+                rel_postings.push(Posting {
+                    term,
+                    field: 0,
+                    doc: doc as u64,
+                    tf: 1,
+                });
+            }
+            rel_docs.push(DocEntry {
+                entity: *entity,
+                len,
+                // reltype 0 is KNOWS.
+                endpoints: Some((*src, *dst, 0)),
+            });
+        }
+        rel_postings.sort_by(|a, b| {
+            (a.term.as_str(), a.field, a.doc).cmp(&(b.term.as_str(), b.field, b.doc))
+        });
+        let rel_stats = write_fulltext_index(
+            &dir,
+            "fulltext/rel_KNOWS",
+            rel_docs.into_iter().map(Ok),
+            rel_postings.into_iter().map(Ok),
+            BLOCK,
+            LEVEL,
+            &|_| None,
+        )
+        .unwrap();
+        for name in &rel_stats.files {
+            inv_names.push(Box::leak(name.clone().into_boxed_str()));
+        }
+        fulltext_indexes.push(graph_format::manifest::FulltextIndexDesc {
+            name: "rel_KNOWS".into(),
+            entity: EntityKind::Edge,
+            label_or_type: "KNOWS".into(),
+            properties: vec!["fact".into()],
+            stopwords: vec!["the".into()],
+            stemmer: None,
+            doc_count: rel_stats.doc_count,
+            avg_doc_len: rel_stats.avg_doc_len,
+        });
     }
     for name in inv_names {
         add(name, &mut files, &mut block_sizes);

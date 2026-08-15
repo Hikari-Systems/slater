@@ -11841,6 +11841,42 @@ fn run_ft(root_tag: &str, q: &str) -> (std::path::PathBuf, QueryResult) {
     (root, res)
 }
 
+/// A relationship hit must not cost a scan of the whole corpus to fetch its document.
+///
+/// The core arm reads the document record to get the hit's entity id — an O(1) read that
+/// already yields the endpoints too — and then discarded everything but the id, so
+/// `fulltext_doc_entry` re-found the very record it had just held, by scanning `.docs.blk`
+/// from the top. That is O(hits x corpus) on every relationship query.
+///
+/// Asserted as reads-per-hit rather than as a timing, so it cannot go green on a fast
+/// machine. The fixture's corpus is deliberately larger than the result set: querying the
+/// term only `beta` carries returns one edge out of three.
+#[test]
+fn a_relationship_hit_does_not_scan_the_corpus_for_its_document() {
+    let (root, graph, _) = testgen::write_basic_with_fulltext("exec_ft_rel_docscan");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let engine = Engine::new(&gen, &cache);
+    let ast = parser::parse(
+        "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (beta)') \
+         YIELD relationship AS r, score RETURN r, score",
+    )
+    .unwrap();
+
+    super::fulltext::DOC_READ_COUNT.with(|c| c.set(0));
+    let res = engine.run(&ast).unwrap();
+    let reads = super::fulltext::DOC_READ_COUNT.with(|c| c.get());
+
+    assert_eq!(res.rows.len(), 1, "expected the one `beta` edge");
+    // One hit. The core arm reads its record once; nothing else should need a read.
+    assert!(
+        reads <= 2,
+        "a single relationship hit read {reads} document records; the record is already \
+         held when the hit is scored, so this should not grow with the corpus"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn fulltext_query_nodes_binds_the_matching_nodes() {
     let (root, res) = run_ft(

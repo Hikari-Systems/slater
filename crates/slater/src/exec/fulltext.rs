@@ -51,6 +51,24 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: how many `.docs.blk` records this statement read.
+    ///
+    /// The document record is what a relationship hit needs (its endpoints), and the
+    /// only honest way to assert that fetching it costs O(hits) rather than O(corpus)
+    /// is to count the reads. Thread-local, and the full-text call runs entirely on the
+    /// calling thread, so the count is exact.
+    pub(crate) static DOC_READ_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read a document record, counting the read under `cfg(test)`.
+fn read_doc(r: &graph_format::fulltext::index::FulltextReader, docid: u64) -> Result<DocEntry> {
+    #[cfg(test)]
+    DOC_READ_COUNT.with(|c| c.set(c.get() + 1));
+    r.doc(docid)
+}
+
 impl<'g, V: ReadView> Engine<'g, V> {
     /// Dense ids of every entity a level above the core generation has touched: the write
     /// delta's, plus every sealed segment's rows.
@@ -92,27 +110,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
             || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
     }
 
-    /// The document record for a hit. Core hits read it from `.docs.blk`; an overlay hit
-    /// has no record there, so its endpoints are unavailable — which is consistent, since
-    /// the overlay arm is nodes-only.
-    fn fulltext_doc_entry(
-        &self,
-        fc: &FulltextCallClause,
-        entity: u64,
-        reader: Option<&graph_format::fulltext::index::FulltextReader>,
-    ) -> Result<DocEntry> {
-        if let Some(r) = reader {
-            // A core document's record carries its endpoints; find it by scanning only
-            // when we must. The common path is a node index, which needs no endpoints.
-            if fc.relationships {
-                for d in 0..r.doc_count() {
-                    let doc = r.doc(d)?;
-                    if doc.entity == entity {
-                        return Ok(doc);
-                    }
-                }
-            }
-        }
+    /// A synthetic document record for an **overlay** hit, which is in no `.docs.blk`.
+    ///
+    /// A core hit never comes here: its record was read to score it and is carried
+    /// forward, so this is not the place to go looking for one. It used to be — this
+    /// scanned `.docs.blk` from the top to re-find a record the caller had just held,
+    /// which made every relationship query O(hits x corpus).
+    ///
+    /// `len` is 0 because nothing downstream reads it, and `endpoints` is `None` because
+    /// the overlay arm is nodes-only; when it grows an edge arm, this is where a born
+    /// edge's endpoints come from.
+    fn fulltext_doc_entry(&self, _fc: &FulltextCallClause, entity: u64) -> Result<DocEntry> {
         Ok(DocEntry {
             entity,
             len: 0,
@@ -292,28 +300,44 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 .map_err(|e| anyhow::anyhow!("{e:#} (in {proc}('{}', …))", fc.label))?;
 
             // ── the core arm, minus everything a newer level has touched ──
-            let mut scored: Vec<(u64, f64)> = Vec::new();
+            //
+            // The document record is carried forward, not just the entity id. Scoring a
+            // hit already reads the record — it is how the entity id is known — and for a
+            // relationship that record is also the only place the endpoints live. Keeping
+            // it is what stops the projection below having to find it again.
+            let mut scored: Vec<(u64, f64, Option<DocEntry>)> = Vec::new();
             if let Some(r) = reader {
                 // Over-fetch by the overlay's size: a suppressed hit consumes a slot the
                 // limit would otherwise have given to a live document, so asking for
                 // exactly `limit` here can return fewer than `limit` live results.
                 let want = limit.saturating_add(overlay.len());
                 for hit in search(r, &q, desc.avg_doc_len, params, want)? {
-                    let entity = r.doc(hit.doc)?.entity;
+                    let doc = read_doc(r, hit.doc)?;
+                    let entity = doc.entity;
                     if overlay.contains(&entity) || self.fulltext_dead(entity, fc.relationships)? {
                         continue;
                     }
-                    scored.push((entity, hit.score));
+                    scored.push((entity, hit.score, Some(doc)));
                 }
             }
 
             // ── the overlay arm ──
-            scored.extend(self.fulltext_overlay_hits(fc, desc, &analyzer, &q, &overlay)?);
+            // An overlay document is in no `.docs.blk`, so it brings no record; the
+            // projection synthesises one.
+            scored.extend(
+                self.fulltext_overlay_hits(fc, desc, &analyzer, &q, &overlay)?
+                    .into_iter()
+                    .map(|(e, s)| (e, s, None)),
+            );
 
             // One document can reach here from at most one arm — the core arm skipped
             // every id the overlay owns — so a duplicate would be a suppression bug.
             debug_assert_eq!(
-                scored.iter().map(|(e, _)| *e).collect::<HashSet<_>>().len(),
+                scored
+                    .iter()
+                    .map(|(e, ..)| *e)
+                    .collect::<HashSet<_>>()
+                    .len(),
                 scored.len(),
                 "a full-text document was scored by both arms"
             );
@@ -322,9 +346,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
             scored.truncate(limit);
             self.charge(scored.len() as u64)?;
 
-            for (entity, score) in scored {
+            for (entity, score, carried) in scored {
                 let hit = Hit { doc: 0, score };
-                let doc = self.fulltext_doc_entry(fc, entity, reader)?;
+                let doc = match carried {
+                    Some(d) => d,
+                    None => self.fulltext_doc_entry(fc, entity)?,
+                };
                 let mut r = row.clone();
                 for bound in &new_vars {
                     let output = fc
