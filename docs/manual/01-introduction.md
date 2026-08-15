@@ -73,7 +73,7 @@ A few concepts recur throughout the manual:
   plus its segments into what the server serves. Consolidation collapses the
   stack back into a single base ([11 Writing data](11-writing-data.md)).
 - **Format version** — the on-disk format carries a `FORMAT_VERSION` (currently
-  **8**). Slater has **no backwards compatibility**: a server refuses any
+  **9**). Slater has **no backwards compatibility**: a server refuses any
   generation whose format it does not understand, with a "must be rebuilt"
   message, rather than silently mis-reading it ([12 Storage](12-storage.md)).
 

@@ -40,7 +40,17 @@
 /// single layout→id map, with [`pq::HOLE`] (`u64::MAX`) marking a tombstoned record; stored
 /// vectors are **raw** rather than L2-normalised (magnitudes survive a rebuild); and the
 /// Vamana arm serves L2 and dot indexes, not cosine alone — see [`vamana`] and [`pq`].
-pub const FORMAT_VERSION: u32 = 8;
+/// v9 admits full-text indexes: `fulltextIndexes` on the manifest and the four per-index
+/// files under `fulltext/` — see [`fulltext`]. Unlike every bump above it, **this one
+/// reinterprets no existing bytes**; the field is additive-optional and the files are new
+/// names in `files[]`, so a v8 generation would have parsed and served correctly. The bump
+/// is a deliberate compatibility fence, not a decoding requirement: without it, an old
+/// server handed a full-text-declaring generation drops the unknown key, and in *unkeyed*
+/// mode — where integrity rests on the content hash over `files[]` — serves it silently
+/// **without** full text. A version mismatch refuses at open (`generation.rs`) in both keyed
+/// and unkeyed mode, which turns that silent degradation into a loud one. The cost is that
+/// every generation in the estate rebuilds; zero legacy installs, so that is the trade taken.
+pub const FORMAT_VERSION: u32 = 9;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -92,7 +102,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 8);
+        assert_eq!(FORMAT_VERSION, 9);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

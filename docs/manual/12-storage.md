@@ -106,7 +106,7 @@ polls it and hot-reloads when it changes ([13 Deployment](13-deployment.md)).
 `MANIFEST.json` is written last by the builder and validated first by the reader.
 Fields worth knowing:
 
-- `formatVersion` — currently **8**. Slater has **no backwards compatibility**: a
+- `formatVersion` — currently **9**. Slater has **no backwards compatibility**: a
   reader refuses any generation whose format it does not understand, with a "must
   be rebuilt" message, rather than mis-reading it.
 - `contentHash` — a BLAKE3 hash over the file inventory; the generation's identity.

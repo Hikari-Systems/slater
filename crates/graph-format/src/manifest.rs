@@ -410,14 +410,17 @@ pub struct Manifest {
     /// sealed manifest in the estate. Same treatment [`AnnNav`] took for `nav` (HIK-137),
     /// and for the same reason.
     ///
-    /// The change therefore needs no format bump: it reinterprets no existing bytes, and
-    /// the four files are new names in `files[]`.
+    /// The shape reinterprets no existing bytes — the four files are new names in
+    /// `files[]` — so it *could* have shipped without a format bump. It did not, and the
+    /// reason is a hazard the shape alone cannot close: an old server handed a
+    /// full-text-declaring generation drops the unknown key, and while keyed mode then
+    /// refuses it on the MAC, **unkeyed** mode — where integrity rests on the content hash
+    /// over `files[]` — serves it silently *without* full text. [`crate::FORMAT_VERSION`]
+    /// 9 makes that a refusal at open in both modes, so the failure is loud rather than a
+    /// query returning fewer rows than it should. See the v9 note on that constant.
     ///
-    /// **Ordering constraint for operators:** an *old* server handed a *new*
-    /// full-text-declaring generation drops the unknown key. Keyed, the MAC then differs
-    /// and it is refused; **unkeyed**, where integrity rests on the content hash over
-    /// `files[]`, it is served silently *without* full text. Roll servers before
-    /// publishing full-text-declaring generations.
+    /// The additive-optional treatment stays regardless: it is what keeps a graph that
+    /// declares no full-text index serialising to the same bytes it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fulltext_indexes: Vec<FulltextIndexDesc>,
     /// Per-reltype distinct **source** node counts (index = reltype id, aligned
