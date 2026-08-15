@@ -370,3 +370,86 @@ fn an_empty_delta_does_not_disturb_the_core_answer() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&root2);
 }
+
+// ── a deleted relationship must stop matching ────────────────────────────────
+//
+// A relationship index is served from the core generation alone. That costs recall on
+// *new* facts, which is a stated limit — but it must never cost correctness on deleted
+// ones. An index that keeps returning a fact the graph no longer holds is worse than one
+// that is merely behind.
+
+/// All three KNOWS edges share the term `shared`, so this addresses the whole corpus and
+/// a suppression shows up as a missing id rather than as an empty result.
+const FT_KNOWS_SHARED: &str = "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (shared)') \
+     YIELD relationship AS r RETURN id(r) AS eid ORDER BY eid";
+
+fn ft_edge_ids(res: &QueryResult) -> Vec<i64> {
+    res.rows
+        .iter()
+        .map(|r| match &r[0] {
+            Val::Int(i) => *i,
+            other => panic!("expected an edge id, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Deleting a relationship through the writable layer must remove it from full text
+/// immediately, without waiting for a consolidation to rebuild the index.
+#[test]
+fn a_deleted_relationship_stops_matching_before_consolidation() {
+    // Control: with an empty delta the fixture's three KNOWS edges all match.
+    let (root0, all) = run_ft_delta("exec_ft_reldel_ctl", |_| {}, FT_KNOWS_SHARED);
+    assert_eq!(
+        ft_edge_ids(&all),
+        [0, 1, 4],
+        "control: every KNOWS edge is a document"
+    );
+    let _ = std::fs::remove_dir_all(&root0);
+
+    // e0 is Alice -KNOWS-> Bob. Delete it, and it must stop being returned — while its
+    // two siblings, which the same query matches, must not.
+    let (root, res) = run_ft_delta(
+        "exec_ft_reldel",
+        |mem| {
+            mem.delete_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Bob".into()),
+                Some(0),
+                Some(1),
+            );
+        },
+        FT_KNOWS_SHARED,
+    );
+    assert_eq!(
+        ft_edge_ids(&res),
+        [1, 4],
+        "the deleted edge must be gone and its siblings must survive"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A relationship whose *endpoint* was deleted is gone too — the edge is unreachable, so
+/// returning it from full text would hand the caller a relationship to a node that no
+/// longer exists.
+#[test]
+fn a_relationship_to_a_deleted_node_stops_matching() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_reldel_node",
+        |mem| {
+            // Bob is node 1: the destination of e0 and the source of e1.
+            mem.delete_node("Person", "name", Value::Str("Bob".into()), Some(1));
+        },
+        FT_KNOWS_SHARED,
+    );
+    assert_eq!(
+        ft_edge_ids(&res),
+        [4],
+        "both edges incident to Bob are gone; Alice -KNOWS-> Carol survives"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

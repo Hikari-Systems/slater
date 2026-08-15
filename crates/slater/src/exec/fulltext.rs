@@ -27,6 +27,14 @@
 //! in the core arm, so a document whose text changed is scored once, from its current
 //! text, rather than twice or from a stale copy.
 //!
+//! **The overlay arm is nodes-only; suppression is not.** A relationship index has no
+//! overlay yet, so it lags on facts written since the build — a stated limit, closing at
+//! the next consolidation. It does *not* lag on deleted ones: `fulltext_dead` asks the
+//! same three questions of an edge that the traversal overlay asks, so a fact the graph
+//! no longer holds stops matching immediately. Recall and correctness are deliberately
+//! not traded off together here, because an index that returns deleted facts is worse
+//! than one that is merely behind.
+//!
 //! # The approximation, stated rather than hidden
 //!
 //! Both arms score with **one reconciled idf**, taken from the core index's statistics, so
@@ -98,16 +106,74 @@ impl<'g, V: ReadView> Engine<'g, V> {
         Ok(ids)
     }
 
-    /// Whether this entity has been deleted out from under the built index.
-    fn fulltext_dead(&self, id: u64, relationships: bool) -> Result<bool> {
-        if relationships {
-            // An edge index is core-only, so the only suppression that applies is a
-            // deleted *endpoint*, which the executor already drops downstream.
-            return Ok(false);
-        }
+    /// Whether a **node** has been deleted, in the delta or in a sealed segment. The
+    /// overlay arm asks this directly (it holds ids, not document records); the edge arm
+    /// asks it of each endpoint.
+    fn fulltext_node_dead(&self, id: u64) -> Result<bool> {
         let stack = self.gen.core_stack();
         Ok(self.gen.delta().is_tombstoned(id)
             || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
+    }
+
+    /// Whether this document has been deleted out from under the built index.
+    ///
+    /// Takes the whole document record rather than an id because a **relationship**
+    /// cannot be checked without its endpoints, and the record already carries them —
+    /// the caller read it to score the hit.
+    ///
+    /// A relationship index is served from the core generation alone, which costs recall
+    /// on facts written since the build. That is a stated limit. It must not also cost
+    /// *correctness* on deleted ones: an index that keeps returning a fact the graph no
+    /// longer holds is worse than one that is merely behind. This is what makes the edge
+    /// arm honest about deletion while its overlay arm does not yet exist.
+    ///
+    /// Deletion reaches an edge three ways, and all three are asked here:
+    ///
+    /// 1. **An endpoint was deleted**, which takes every incident edge with it. An
+    ///    earlier comment here claimed the executor dropped these downstream; it does
+    ///    not, and a regression test now pins that.
+    /// 2. **A sealed segment removed the edge**, by id — segments have always suppressed
+    ///    that way.
+    /// 3. **The live delta tombstoned it**, by `(reltype, neighbour)`. That is the exact
+    ///    predicate the traversal overlay applies (`exec.rs`, the `suppress` set), and
+    ///    matching it verbatim is deliberate: suppressing every parallel edge of a type
+    ///    to a neighbour is precisely what a delete does today, so full text agrees with
+    ///    traversal by construction rather than by coincidence. When a keyed `DELETE`
+    ///    later narrows it, this narrows with it and needs no edit.
+    fn fulltext_dead(&self, doc: &DocEntry, relationships: bool) -> Result<bool> {
+        let stack = self.gen.core_stack();
+        let node_dead = |id: u64| self.fulltext_node_dead(id);
+        if !relationships {
+            return node_dead(doc.entity);
+        }
+        let Some((src, dst, reltype)) = doc.endpoints else {
+            // A relationship index whose documents carry no endpoints is malformed; the
+            // projection refuses it by name a few lines on, which is a better error than
+            // anything invented here.
+            return Ok(false);
+        };
+        if node_dead(src)? || node_dead(dst)? {
+            return Ok(true);
+        }
+        if !stack.is_singleton() {
+            if let Some(row) = stack.resolve_edge_row(doc.entity)? {
+                if row.tombstoned {
+                    return Ok(true);
+                }
+            }
+        }
+        let delta = self.gen.delta();
+        if !delta.is_empty() {
+            for e in delta.out_edges(src) {
+                if e.tombstoned
+                    && e.other == dst
+                    && self.gen.reltype_id(&e.reltype) == Some(reltype)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// A synthetic document record for an **overlay** hit, which is in no `.docs.blk`.
@@ -155,7 +221,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         ids.sort_unstable();
         for id in ids {
             self.check_deadline()?;
-            if self.fulltext_dead(id, false)? {
+            if self.fulltext_node_dead(id)? {
                 continue;
             }
             if !self.node_label_ids(id)?.contains(&label_id) {
@@ -314,7 +380,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 for hit in search(r, &q, desc.avg_doc_len, params, want)? {
                     let doc = read_doc(r, hit.doc)?;
                     let entity = doc.entity;
-                    if overlay.contains(&entity) || self.fulltext_dead(entity, fc.relationships)? {
+                    if overlay.contains(&entity) || self.fulltext_dead(&doc, fc.relationships)? {
                         continue;
                     }
                     scored.push((entity, hit.score, Some(doc)));
