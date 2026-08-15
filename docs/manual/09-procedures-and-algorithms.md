@@ -207,8 +207,10 @@ its old text. The effect is a uniform downward bias on recently-edited terms,
 proportional to the overlay's share of the graph, and it disappears at `CALL
 slater.consolidate()`. Ranking is affected; which documents match is not.
 
-One limit: a **relationship** index is served from the core alone, so an edge whose
-`fact` changed since the build keeps its old text until a consolidation.
+Relationship indexes work the same way: an edge created, edited or deleted through
+the writable layer searches correctly straight away. (In v0.25.0 an edge index was
+served from the core generation alone, so an edge kept its old text — and a deleted
+edge kept matching — until a consolidation. Both are fixed in v0.25.1.)
 
 ## Not supported
 

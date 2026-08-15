@@ -1,6 +1,14 @@
 # Full-text delta plan — closing the relationship overlay gap
 
-Status: **planned, not started.** Written 2026-08-15, against `main` at v0.25.0.
+Status: **DONE**, all five slices, on `feat/fulltext-edge-overlay`. Written 2026-08-15
+against `main` at v0.25.0; completed the same day.
+
+What the plan got wrong is recorded inline rather than edited out — the sequencing claim
+(corrected below), and then three separate overestimates of the work. Slice 0 was not a
+format change (the record was already read and thrown away), slice 1 needed no new
+primitive, and slice 2 was one method over an accessor that already existed. The pattern
+is worth naming: each estimate was made from a code comment describing a limitation,
+rather than from the code that would have to change.
 
 ## Context
 
