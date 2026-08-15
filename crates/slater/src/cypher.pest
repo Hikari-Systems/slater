@@ -164,7 +164,19 @@ insert_stmt = { kw_insert ~ node_pattern ~ (rel_pattern ~ node_pattern)? ~ retur
 // `WITH` that introduces a binding, filters, reorders, limits or de-duplicates, since any
 // of those *would* mean something the write path is not doing. Do not read this rule as a
 // stub for a general mid-write `WITH`.
-write_actions = { (merge_action+ ~ write_step*) | write_step+ }
+// The `&(…)` guard is load-bearing, and it guards a *read*, not a write. `write_step+`
+// alone is satisfiable by a `WITH` with no updating clause behind it, so the write grammar
+// would claim `MATCH (n:Person) WITH n RETURN n` — an ordinary read. That is not a
+// mis-filing that costs a little tidiness: `parse_statement` commits to the write path the
+// moment `write_statement` matches, and returns the lowering failure rather than retrying
+// as a read. So the query becomes unanswerable, and since only a *writable* graph calls
+// `parse_statement`, enabling the writable layer would narrow what can be read — reaching
+// any client that uses `WITH`, which is most non-trivial Cypher.
+//
+// The predicate asserts, without consuming, that an updating clause lies behind any leading
+// `WITH`s. It leaves the parse tree identical (a pest predicate emits no pairs), so the
+// steps below are still `write_step`s and `lower_write_statement` is unchanged.
+write_actions = { (merge_action+ ~ write_step*) | (&(with_clause* ~ update_clause) ~ write_step+) }
 write_step = { with_clause | update_clause }
 merge_action = { kw_on ~ (kw_create | kw_match) ~ set_clause }
 

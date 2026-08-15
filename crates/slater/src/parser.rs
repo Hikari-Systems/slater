@@ -5493,6 +5493,61 @@ mod tests {
         assert!(parse("CALL slater.consolidate()").is_err());
     }
 
+    /// A pure read that happens to use `WITH` must stay a read on a **writable** graph.
+    ///
+    /// `parse_statement` commits to the write path the moment `write_statement` matches —
+    /// a lowering failure is returned, not retried as a read. So a write grammar that can
+    /// be satisfied *without an updating clause* does not merely mis-file these queries,
+    /// it makes them unanswerable: turning the writable layer on would narrow what can be
+    /// read, and `WITH` is in most non-trivial Cypher. The rule is that a write must
+    /// contain at least one `SET`/`REMOVE`/`DELETE` (or a `MERGE` action).
+    #[test]
+    fn a_read_using_with_is_not_claimed_by_the_write_path() {
+        for q in [
+            "MATCH (n:Person) WITH n RETURN n",
+            "MATCH (n:Person) WITH n, 0 AS k RETURN n",
+            "MATCH (n:Person) WITH n.city AS c, count(*) AS c2 WHERE c2 > 1 RETURN c",
+            "MATCH (n:Person) WITH n WHERE n.age > 30 RETURN n",
+            "MATCH (n:Person) WITH DISTINCT n RETURN n",
+            "MATCH (n:Person) WITH n ORDER BY n.age LIMIT 5 RETURN n",
+            // Anchor carrying an inline property, so it clears the business-key check and
+            // the no-op-`WITH` check and reaches the *last* write guard ("must SET or
+            // REMOVE"). Same refusal, three clauses further in — a fix that only relaxed
+            // the earlier guards would leave this one still failing.
+            "MATCH (n:Person {uuid: 'u'}) WITH n RETURN n",
+            "MATCH (n:Person {uuid: 'u'}) WITH n RETURN n.name",
+        ] {
+            // The read parser is the control: these are ordinary reads by construction.
+            assert!(parse(q).is_ok(), "control: {q:?} must parse as a read");
+            assert!(
+                matches!(parse_statement(q), Ok(Statement::Read(_))),
+                "a writable graph must still read {q:?}, got {:?}",
+                parse_statement(q).map(|s| match s {
+                    Statement::Read(_) => "Read",
+                    Statement::Write(_) => "Write",
+                    Statement::WriteEdge(_) => "WriteEdge",
+                    Statement::Create(_) => "Create",
+                    Statement::Consolidate => "Consolidate",
+                })
+            );
+        }
+
+        // The other half of the rule: a genuine write is still claimed by the write path,
+        // including the no-op `WITH` between updating clauses that graphiti emits.
+        for q in [
+            "MATCH (n:Person {uuid: 'u'}) SET n.age = 31",
+            "MERGE (n:Person {uuid: 'u'}) SET n.age = 31",
+            "MATCH (n:Person {uuid: 'u'}) WITH n SET n.age = 31",
+            "MATCH (n:Person {uuid: 'u'}) SET n.age = 31 WITH n RETURN n.age",
+            "MERGE (n:Person {uuid: 'u'}) ON CREATE SET n.age = 1",
+        ] {
+            assert!(
+                matches!(parse_statement(q), Ok(Statement::Write(_))),
+                "expected a write for {q:?}"
+            );
+        }
+    }
+
     #[test]
     fn metadata_call_whitelist_only() {
         // The read-only metadata + algo procs parse; every other CALL stays rejected
