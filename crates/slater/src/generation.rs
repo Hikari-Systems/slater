@@ -1336,7 +1336,8 @@ fn open_carried_graph(
     // set does not name — nor a different revision of one it does.
     if !set.vector_artifacts.iter().any(|a| a == r) {
         bail!(
-            "generation index {stem} references carried vector-graph artifact {} (content              {}), which the set manifest {} does not name — refusing an unauthenticated              composition",
+            "generation index {stem} references carried vector-graph artifact {} (content {}), \
+             which the set manifest {} does not name — refusing an unauthenticated composition",
             r.uuid,
             r.content_hash,
             set.set_uuid
@@ -1344,7 +1345,8 @@ fn open_carried_graph(
     }
     if m.records != vi.count {
         bail!(
-            "carried vector-graph artifact {} holds {} records but generation index {stem}              declares {} — refusing a stale graph paired with a newer id column",
+            "carried vector-graph artifact {} holds {} records but generation index {stem} \
+             declares {} — refusing a stale graph paired with a newer id column",
             r.uuid,
             m.records,
             vi.count
@@ -1355,21 +1357,24 @@ fn open_carried_graph(
         Some(h) => {
             if h.aead != crypto::AEAD_NAME {
                 bail!(
-                    "carried vector-graph artifact {} uses AEAD {:?}, which this build does                      not implement",
+                    "carried vector-graph artifact {} uses AEAD {:?}, which this build does not \
+                     implement",
                     r.uuid,
                     h.aead
                 );
             }
             if h.kdf != crypto::KDF_NAME {
                 bail!(
-                    "carried vector-graph artifact {} uses KDF {:?}, which this build does                      not implement",
+                    "carried vector-graph artifact {} uses KDF {:?}, which this build does not \
+                     implement",
                     r.uuid,
                     h.kdf
                 );
             }
             let key = master_key.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "carried vector-graph artifact {} is encrypted at rest but no key was                      supplied (set config.encryption.keyEnv or keyFile)",
+                    "carried vector-graph artifact {} is encrypted at rest but no key was \
+                     supplied (set config.encryption.keyEnv or keyFile)",
                     r.uuid
                 )
             })?;

@@ -419,7 +419,10 @@ impl Graphs {
                 && !consolidating
             {
                 bail!(
-                    "refusing to swap graph '{name}' to generation {on_disk}: the writable                      layer holds {pending} pending entities against the generation now                      served ({}), and a swap would abandon them. Run                      `CALL slater.consolidate()` to fold the delta into a new generation,                      then publish again.",
+                    "refusing to swap graph '{name}' to generation {on_disk}: the writable layer \
+                     holds {pending} pending entities against the generation now served ({}), \
+                     and a swap would abandon them. Run `CALL slater.consolidate()` to fold the \
+                     delta into a new generation, then publish again.",
                     live.uuid().0,
                 );
             }
@@ -707,7 +710,10 @@ impl Graphs {
             if on_disk != pin {
                 let _ = std::fs::remove_dir_all(&dump_path);
                 bail!(
-                    "refusing to consolidate '{name}': {} hashes to {on_disk} but the ACL in                      force is {pin}. The rebuild would be stamped against an acl.json this                      server never accepted, which would make it the one it enforces. Restore                      the file, or restart so the new ACL is adopted through the stamp gate.",
+                    "refusing to consolidate '{name}': {} hashes to {on_disk} but the ACL in \
+                     force is {pin}. The rebuild would be stamped against an acl.json this \
+                     server never accepted, which would make it the one it enforces. Restore the \
+                     file, or restart so the new ACL is adopted through the stamp gate.",
                     path.display(),
                 );
             }
@@ -771,7 +777,9 @@ impl Graphs {
             let stamp = candidate.manifest().acl_blake3.clone();
             if stamp.as_deref() != Some(pin) {
                 bail!(
-                    "refusing the consolidated generation of '{name}': it is stamped {:?} but                      the ACL in force is {pin}. The rebuild read an acl.json this server never                      accepted; serving it would make that file the one enforced.",
+                    "refusing the consolidated generation of '{name}': it is stamped {:?} but \
+                     the ACL in force is {pin}. The rebuild read an acl.json this server never \
+                     accepted; serving it would make that file the one enforced.",
                     stamp.as_deref().unwrap_or("<none>"),
                 );
             }

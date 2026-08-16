@@ -845,7 +845,9 @@ fn refuse_orphaned_delta(
     Err(Failure::new(
         CODE_EXECUTION,
         format!(
-            "the writable layer is bound to generation {} but graph '{}' is now serving              {} — this write cannot be made durable against the served generation and              has NOT been applied. Consolidate or restart the server to rebind the              delta.",
+            "the writable layer is bound to generation {} but graph '{}' is now serving {} — \
+             this write cannot be made durable against the served generation and has NOT been \
+             applied. Consolidate or restart the server to rebind the delta.",
             writer.core_uuid().0,
             gen.graph(),
             gen.uuid().0,
