@@ -784,10 +784,21 @@ async fn parses_do_not_block_the_reactor() {
         let t0 = Instant::now();
         tokio::task::yield_now().await;
         let reactor_stall = t0.elapsed();
+        // The bug holds the reactor for FLOOD x one_parse; a healthy run returns in ~0
+        // plus whatever the scheduler charges. The bound sits between those, not at the
+        // edge of the healthy case: `< one_parse` looks stricter but only buys precision
+        // this test does not need, since the failure it guards is 8x away.
+        //
+        // It was `< one_parse`, and CI failed it at 61.19ms against a 58.30ms parse — a
+        // 5% overshoot on a shared runner, with the mechanism assertion below passing.
+        // Widening keeps the guard in the fast suite rather than exiling a real regression
+        // test to `--ignored`, which is what the last wall-clock flake here cost.
+        let bound = one_parse * 2;
         assert!(
-            reactor_stall < one_parse,
+            reactor_stall < bound,
             "(writable={writable}) the reactor was held for {reactor_stall:?} while {FLOOD} \
-             queries parsed (one parse = {one_parse:?}) — parsing is running on a reactor worker"
+             queries parsed (one parse = {one_parse:?}, bound {bound:?}) — parsing is running \
+             on a reactor worker"
         );
         // Timing alone cannot tell "the parse moved to a blocking thread" from "something
         // yielded before the parse", which would leave the bug in place and the assertion
