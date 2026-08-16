@@ -540,6 +540,7 @@ impl Graphs {
         cache: &BlockCache,
         vector_cache: &VectorIndexCache,
         data_dir: &Path,
+        acl_pin: Option<&str>,
         build: impl Fn(&Path, &str, &Path, Option<&[u8]>, Option<&Path>) -> Result<()>,
     ) -> Result<GenId> {
         let writer = self
@@ -665,7 +666,30 @@ impl Graphs {
         // the keyless invocation production actually made. Widening the signature makes a
         // test that ignores the key a deliberate act rather than an accident.
         // The ACL the server is enforcing, so the rebuild is stamped with it (HIK-283).
+        //
+        // `acl_pin` is the digest of the ACL **in force** — the one `AclHandle` is serving,
+        // which is not necessarily what `acl.json` says right now. The two diverge by
+        // design: `reload_checked` refuses a candidate that violates a served generation's
+        // stamp and keeps the last-good, so an edit does not take effect until a rebuild.
+        //
+        // Handing the child a *path* would make it stamp whatever the file says at the
+        // moment it reads, and the swap-in check would then compare that stamp against a
+        // digest re-read from the same file — so the two agree and it is accepted. A
+        // consolidation would launder a rejected `acl.json` into a blessed one. Checking
+        // here refuses before paying for a rebuild that could take hours; the check after
+        // the build is what actually closes the window.
         let acl_for_build = self.acl_path.clone();
+        if let (Some(pin), Some(path)) = (acl_pin, acl_for_build.as_deref()) {
+            let on_disk = graph_format::integrity::hash_file(path)
+                .with_context(|| format!("hash acl {} before consolidating", path.display()))?;
+            if on_disk != pin {
+                let _ = std::fs::remove_dir_all(&dump_path);
+                bail!(
+                    "refusing to consolidate '{name}': {} hashes to {on_disk} but the ACL in                      force is {pin}. The rebuild would be stamped against an acl.json this                      server never accepted, which would make it the one it enforces. Restore                      the file, or restart so the new ACL is adopted through the stamp gate.",
+                    path.display(),
+                );
+            }
+        }
         if let Err(e) = build(
             &dump_path,
             name,
@@ -683,6 +707,15 @@ impl Graphs {
         // swapped it in already; `adopt_published_generation` reports what is served
         // either way, so the retire below runs whoever won the swap — it is *this* call's
         // to run, and skipping it would orphan the delta we just folded in.
+        // Whatever the child read, the generation it published must carry the stamp of the
+        // ACL in force. This is the check that closes the window the pre-build one only
+        // narrows: the file can change between that hash and the child's read.
+        //
+        // Deliberately *not* solved by copying the ACL into the scratch dump instead. That
+        // would turn a refusal into a correct build, but it puts a second plaintext copy of
+        // the password hashes on disk for the length of the rebuild and leaves it behind on
+        // a crash. Refusing costs an operator a rebuild in a case that should not arise;
+        // the copy costs everyone an extra copy of the credentials, always.
         //
         // If the adopt is *refused* — the rebuilt generation violates the manifest policy,
         // say — `current` has already been moved to it by the builder. Leaving it there
@@ -692,6 +725,30 @@ impl Graphs {
         // the generation that was serving before, which is by construction one the policy
         // already accepted. Best effort, and loud when it cannot be done: a rollback
         // failure leaves the operator exactly where they were, and they need to know.
+        // The stamp the child actually wrote, checked against the ACL in force *before* the
+        // generation is adopted — so a rebuild against bytes the server never accepted is
+        // never served, even for an instant.
+        if let Some(pin) = acl_pin {
+            let published = Generation::current_uuid_in(self.store.as_ref(), name)?;
+            let candidate = Generation::open_with_store_opts_cached(
+                self.store.as_ref(),
+                name,
+                self.master_key_bytes(),
+                self.verify_integrity,
+                self.range_index_cache_bytes,
+                self.degree_residency,
+                self.degree_column_bytes,
+            )
+            .with_context(|| format!("open consolidated generation {published} of '{name}'"))?;
+            let stamp = candidate.manifest().acl_blake3.clone();
+            if stamp.as_deref() != Some(pin) {
+                bail!(
+                    "refusing the consolidated generation of '{name}': it is stamped {:?} but                      the ACL in force is {pin}. The rebuild read an acl.json this server never                      accepted; serving it would make that file the one enforced.",
+                    stamp.as_deref().unwrap_or("<none>"),
+                );
+            }
+        }
+
         let new_gen = match self
             .adopt_published_generation(name, vector_cache)
             .with_context(|| format!("swap in consolidated generation for '{name}'"))

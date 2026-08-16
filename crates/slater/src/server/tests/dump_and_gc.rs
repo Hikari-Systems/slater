@@ -84,7 +84,7 @@ fn consolidate_folds_delta_into_fresh_generation() {
             Ok(())
         };
     let published = graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap();
     assert_eq!(published.0, new_uuid, "swapped to the new generation");
 
@@ -391,7 +391,7 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
             Ok(())
         };
     let published = graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap();
     assert_eq!(
         published.0, new_uuid,
@@ -667,7 +667,7 @@ fn gc_after_retarget_reclaims_the_prior_set() {
         Ok(())
     };
     graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap();
     let gen1 = graphs.get("people").unwrap();
     assert!(gen1.stack().is_singleton(), "retarget collapsed the stack");

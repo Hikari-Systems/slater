@@ -222,7 +222,7 @@ fn consolidation_folds_a_flushed_l0_level() {
             Ok(())
         };
     let published = graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap();
     assert_eq!(published.0, new_uuid);
 
@@ -273,7 +273,7 @@ fn failed_consolidation_preserves_the_write_and_old_core() {
             bail!("simulated builder crash")
         };
     let err = graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap_err();
     assert!(format!("{err:#}").contains("simulated builder crash"));
 
@@ -387,7 +387,7 @@ fn consolidation_retires_the_delta_when_the_guard_wins_the_swap() {
             Ok(())
         };
     let published = graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap();
 
     // A successful build is reported as one, not as a false failure.
@@ -467,7 +467,7 @@ fn guard_sweep_defers_to_an_in_flight_consolidation() {
             Ok(())
         };
     let published = graphs
-        .consolidate_graph("people", &cache, &vc, &root, build)
+        .consolidate_graph("people", &cache, &vc, &root, None, build)
         .unwrap();
 
     // The consolidation performed its own swap and retired the delta.
@@ -546,7 +546,7 @@ fn a_production_consolidation_honours_non_default_builder_limits() {
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
     let new = graphs
-        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, key, _acl| {
+        .consolidate_graph("people", &cache, &vc, &root, None, |d, g, dd, key, _acl| {
             run_builder(&bin, d, g, dd, key, limits, None, None)
         })
         .expect("the real builder must accept the flags the server sends");
@@ -608,23 +608,31 @@ fn consolidate_via_real_builder() {
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
     let new = graphs
-        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, _key, _acl| {
-            let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
-                .unwrap()
-            {
-                parser::ast::Statement::Write(w) => w,
-                _ => unreachable!(),
-            };
-            execute_write(
-                &writer_mid,
-                gen_mid.as_ref(),
-                &bob,
-                &HashMap::new(),
-                TEST_BOLT_VERSION,
-            )
-            .unwrap();
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
-        })
+        .consolidate_graph(
+            "people",
+            &cache,
+            &vc,
+            &root,
+            None,
+            |d, g, dd, _key, _acl| {
+                let bob =
+                    match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
+                        .unwrap()
+                    {
+                        parser::ast::Statement::Write(w) => w,
+                        _ => unreachable!(),
+                    };
+                execute_write(
+                    &writer_mid,
+                    gen_mid.as_ref(),
+                    &bob,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
+                run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
+            },
+        )
         .unwrap();
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
 
@@ -720,7 +728,7 @@ fn consolidate_carries_vector_indexes_and_embeddings() {
     .unwrap();
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+        .consolidate_graph(&graph, &cache, &vc, &root, None, |d, g, dd, _key, _acl| {
             run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
@@ -781,7 +789,7 @@ fn consolidate_carries_a_delta_written_vector_over_the_base() {
     drop(gen0);
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+        .consolidate_graph(&graph, &cache, &vc, &root, None, |d, g, dd, _key, _acl| {
             run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
@@ -908,7 +916,7 @@ fn a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding() {
 
     // 3. A background consolidation, run while d00 is out of scope.
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+        .consolidate_graph(&graph, &cache, &vc, &root, None, |d, g, dd, _key, _acl| {
             run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
@@ -996,7 +1004,7 @@ fn a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation()
     vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) REMOVE n:Doc");
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+        .consolidate_graph(&graph, &cache, &vc, &root, None, |d, g, dd, _key, _acl| {
             run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
@@ -1053,7 +1061,7 @@ fn a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding() {
 
     // A consolidation while out of scope.
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+        .consolidate_graph(&graph, &cache, &vc, &root, None, |d, g, dd, _key, _acl| {
             run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
@@ -1212,7 +1220,7 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     drop(gen0);
 
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key, _acl| {
+        .consolidate_graph("docs", &cache, &vc, &data, None, |d, g, dd, _key, _acl| {
             // HIK-149: this graph carries a Vamana index, so its dump has a vector-carry
             // sidecar as well as the four base files — the one dump shape the marker test
             // below cannot reach.
@@ -1288,7 +1296,7 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     // is still `vector/Doc.embedding.vamana`. If the subkey were inferred from the path this
     // is the consolidation that would fail.
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key, _acl| {
+        .consolidate_graph("docs", &cache, &vc, &data, None, |d, g, dd, _key, _acl| {
             // HIK-149: this graph carries a Vamana index, so its dump has a vector-carry
             // sidecar as well as the four base files — the one dump shape the marker test
             // below cannot reach.
@@ -1492,7 +1500,7 @@ fn consolidation_hands_the_configured_acl_to_the_builder() {
         *seen.lock().unwrap() = Some(acl.map(|p| p.to_path_buf()));
         anyhow::bail!("stop here: the arguments are what this test is about")
     };
-    let _ = graphs.consolidate_graph("people", &cache, &vc, &root, build);
+    let _ = graphs.consolidate_graph("people", &cache, &vc, &root, None, build);
 
     let handed = seen
         .lock()
@@ -1504,6 +1512,158 @@ fn consolidation_hands_the_configured_acl_to_the_builder() {
         Some(acl_path),
         "the rebuild must be stamped with the ACL the server enforces, or the generation \
          it publishes is refused by the very policy that server is running"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A consolidation must not launder a rejected `acl.json` into a blessed one.
+///
+/// The `aclBlake3` stamp exists so that an edit to `acl.json` does **not** take effect
+/// until a rebuild the operator controls: `reload_checked` refuses a candidate that
+/// violates a served generation's stamp, and the last-good ACL keeps serving. That leaves
+/// two deliberately different notions of "the ACL" — the in-force one held by `AclHandle`,
+/// and whatever bytes are on disk right now.
+///
+/// Handing `slater-build` the *path* makes the rebuild read the second. It stamps the
+/// tampered digest, and the swap-in check then compares that stamp against
+/// `live_acl_digest()`, which re-reads the very same tampered file — so the two agree and
+/// the generation is accepted. The tampered ACL is now what the served generation is
+/// stamped against, so the next reload adopts it. Every step behaves as documented; the
+/// composition is the hole.
+///
+/// The same thing bites without an attacker: an operator editing `acl.json` during a
+/// multi-hour consolidation gets a generation stamped against a file the running server
+/// never accepted.
+#[test]
+fn consolidation_refuses_to_stamp_an_acl_the_server_never_accepted() {
+    let (root, _graph) = testgen::write_indexed_people("hik_acl_launder");
+    let wal = root.join("_wal");
+    let acl_path = write_acl(&root);
+    let digest_a = graph_format::integrity::hash_file(&acl_path).unwrap();
+    patch_manifest(&root, "people", "aclBlake3", serde_json::json!(digest_a));
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    graphs.set_manifest_policy(Some(acl_path.clone()), true);
+
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+    let writer = graphs.writer("people").unwrap();
+    let w = match parser::parse_statement("MERGE (n:Person {name:'Ada'}) SET n.age = 41").unwrap() {
+        parser::ast::Statement::Write(w) => w,
+        _ => unreachable!(),
+    };
+    execute_write(
+        &writer,
+        graphs.get("people").unwrap().as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+
+    // The attacker's edit. On disk only — the running server's in-force ACL is still A,
+    // which is what `acl_pin` carries.
+    let tampered = serde_json::json!({
+        "users": { "reporting": { "passwordArgon2id": hash_password("pw").unwrap(),
+            "grants": { "people": ["read", "write"], "secret": ["read"] } } }
+    });
+    std::fs::write(&acl_path, tampered.to_string()).unwrap();
+    let digest_b = graph_format::integrity::hash_file(&acl_path).unwrap();
+    assert_ne!(digest_a, digest_b, "the tamper must change the digest");
+
+    // A builder that behaves exactly as `slater-build` does: stamp whatever `--acl`
+    // names, read at the moment the child runs.
+    let new_uuid = uuid::Uuid::from_u128(0x89_0000_0000_0000_0000_0000_0000_0002);
+    let build = |_d: &Path, _g: &str, dd: &Path, _k: Option<&[u8]>, acl: Option<&Path>| {
+        testgen::write_indexed_people_at(dd, new_uuid, [41, 25, 40]);
+        if let Some(p) = acl {
+            let stamp = graph_format::integrity::hash_file(p).unwrap();
+            patch_manifest(dd, "people", "aclBlake3", serde_json::json!(stamp));
+        }
+        Ok(())
+    };
+
+    let res = graphs.consolidate_graph("people", &cache, &vc, &root, Some(&digest_a), build);
+
+    assert!(
+        res.is_err(),
+        "a rebuild stamped against an acl.json the server never accepted must be refused; \
+         it was accepted, so the tampered ACL is now blessed by the served generation"
+    );
+    let served = graphs.get("people").unwrap();
+    assert_ne!(
+        served.manifest().acl_blake3.as_deref(),
+        Some(digest_b.as_str()),
+        "the served generation must not carry the tampered ACL's stamp"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The window the pre-build check only narrows: `acl.json` changes *while* the rebuild
+/// runs, which on a large graph is hours.
+///
+/// The pre-build hash agrees, so the build starts; the child then reads a file that has
+/// since changed and stamps the new digest. Only the check on what was actually published
+/// can catch this, which is why both exist — and why this test tampers from inside the
+/// build closure rather than before it.
+#[test]
+fn consolidation_refuses_an_acl_swapped_while_the_rebuild_runs() {
+    let (root, _graph) = testgen::write_indexed_people("hik_acl_launder_midbuild");
+    let wal = root.join("_wal");
+    let acl_path = write_acl(&root);
+    let digest_a = graph_format::integrity::hash_file(&acl_path).unwrap();
+    patch_manifest(&root, "people", "aclBlake3", serde_json::json!(digest_a));
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    graphs.set_manifest_policy(Some(acl_path.clone()), true);
+
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+    let writer = graphs.writer("people").unwrap();
+    let w = match parser::parse_statement("MERGE (n:Person {name:'Ada'}) SET n.age = 41").unwrap() {
+        parser::ast::Statement::Write(w) => w,
+        _ => unreachable!(),
+    };
+    execute_write(
+        &writer,
+        graphs.get("people").unwrap().as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+
+    let new_uuid = uuid::Uuid::from_u128(0x89_0000_0000_0000_0000_0000_0000_0003);
+    let acl_for_closure = acl_path.clone();
+    let build = |_d: &Path, _g: &str, dd: &Path, _k: Option<&[u8]>, acl: Option<&Path>| {
+        // The edit lands after the pre-build check has already passed.
+        let tampered = serde_json::json!({
+            "users": { "reporting": { "passwordArgon2id": hash_password("pw").unwrap(),
+                "grants": { "people": ["read", "write"], "secret": ["read"] } } }
+        });
+        std::fs::write(&acl_for_closure, tampered.to_string()).unwrap();
+        testgen::write_indexed_people_at(dd, new_uuid, [41, 25, 40]);
+        if let Some(p) = acl {
+            let stamp = graph_format::integrity::hash_file(p).unwrap();
+            patch_manifest(dd, "people", "aclBlake3", serde_json::json!(stamp));
+        }
+        Ok(())
+    };
+
+    let err = graphs
+        .consolidate_graph("people", &cache, &vc, &root, Some(&digest_a), build)
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("refusing the consolidated generation"),
+        "the published generation's stamp must be checked, not just the file before the \
+         build; got: {msg}"
     );
     std::fs::remove_dir_all(&root).ok();
 }

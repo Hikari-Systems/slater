@@ -277,6 +277,10 @@ pub(crate) async fn execute_consolidate(
     let builder_limits = ctx.builder_limits;
     let builder_key_env = ctx.builder_key_env.clone();
     let graph = graph.to_string();
+    // The digest of the ACL **in force**, not of whatever `acl.json` says right now. They
+    // diverge by design: a tampered file is refused by the reload gate while the last-good
+    // ACL keeps serving, and a rebuild must be stamped against the one actually serving.
+    let acl_pin = Some(ctx.acl.digest());
     let gc_graph = graph.clone(); // retained for the post-consolidation GC sweep below
     let new_uuid = tokio::task::spawn_blocking(move || {
         graphs.consolidate_graph(
@@ -284,6 +288,7 @@ pub(crate) async fn execute_consolidate(
             &cache,
             &vector_cache,
             &data_dir,
+            acl_pin.as_deref(),
             |dump, g, dd, key, acl| {
                 run_builder(
                     &builder_bin,
