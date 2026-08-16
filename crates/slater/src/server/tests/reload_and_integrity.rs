@@ -491,3 +491,59 @@ fn write_then_read_your_writes_and_survives_reopen() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A generation's stamp is checked against the ACL **in force**, not against a re-read of
+/// `acl.json`.
+///
+/// Those diverge whenever an edit has been refused: `reload_checked` keeps the last-good
+/// ACL serving while the file holds something the server rejected. Verifying a stamp by
+/// re-hashing the file therefore asks only "does the file agree with itself", which
+/// whoever wrote the file can arrange — the mechanism behind HIK-284.
+///
+/// Here a generation is stamped against a tampered `acl.json` while the in-force ACL is
+/// still the original. Against the file it verifies; against the handle it must not.
+#[test]
+fn a_stamp_is_verified_against_the_acl_in_force_not_the_file_on_disk() {
+    let (root, _g, _) = testgen::write_basic("hik284_in_force");
+    let acl_path = write_acl(&root);
+    let digest_a = graph_format::integrity::hash_file(&acl_path).unwrap();
+    let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
+    assert_eq!(acl.digest(), digest_a);
+
+    // The file is tampered; the handle is not reloaded, so the in-force ACL is still A.
+    let tampered = serde_json::json!({
+        "users": { "reporting": { "passwordArgon2id": hash_password("pw").unwrap(),
+            "grants": { "people": ["read", "write"], "secret": ["read"] } } }
+    });
+    std::fs::write(&acl_path, tampered.to_string()).unwrap();
+    let digest_b = graph_format::integrity::hash_file(&acl_path).unwrap();
+    assert_ne!(digest_a, digest_b);
+
+    // A generation stamped against the tampered file — what a rebuild reading the path
+    // would produce.
+    patch_manifest(&root, "people", "aclBlake3", serde_json::json!(digest_b));
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs.set_manifest_policy(Some(acl_path.clone()), false);
+
+    // Without the in-force ACL bound, the check hashes the file and the tampered stamp
+    // agrees with it — the hole, kept here as the contrast that gives the next line
+    // meaning.
+    let m = graphs.get("people").unwrap().manifest().clone();
+    assert!(
+        graphs
+            .check_manifest_policy("people", &m, graphs.live_acl_digest().unwrap().as_deref())
+            .is_ok(),
+        "precondition: against the file, the tampered stamp verifies"
+    );
+
+    graphs.set_in_force_acl(acl.clone());
+    let err = graphs
+        .check_manifest_policy("people", &m, graphs.live_acl_digest().unwrap().as_deref())
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("refusing to serve"),
+        "against the ACL in force, a stamp for a rejected acl.json must be refused: {err:#}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

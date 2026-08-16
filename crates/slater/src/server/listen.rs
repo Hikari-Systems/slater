@@ -213,6 +213,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         Some(cfg.cache.degree_column_bytes),
     )?;
     graphs.set_manifest_policy(Some(PathBuf::from(&cfg.acl_path)), cfg.require_acl_stamp);
+    // Verify stamps against the ACL actually serving, not a re-read of the file (HIK-284).
+    graphs.set_in_force_acl(acl.clone());
     graphs
         .verify_manifest_policy()
         .context("manifest authentication policy")?;

@@ -180,6 +180,10 @@ pub struct Graphs {
     /// Live `acl.json` path used to verify per-generation `aclBlake3` stamps at
     /// open/swap time. `None` ⇒ no ACL stamp checking (e.g. unit-test fixtures).
     acl_path: Option<PathBuf>,
+    /// The ACL **in force** — what `AclHandle` is actually serving, which is not
+    /// necessarily what `acl_path` currently contains. Preferred over re-hashing the
+    /// file when verifying a generation's stamp; see `Graphs::live_acl_digest`.
+    acl_handle: Option<Arc<crate::acl::AclHandle>>,
     /// Refuse to serve a generation whose manifest carries no ACL stamp.
     require_acl_stamp: bool,
     /// Per-generation range-index block-cache budget (`config.cache.rangeIndexCacheBytes`),

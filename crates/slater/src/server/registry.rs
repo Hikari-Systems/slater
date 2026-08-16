@@ -127,6 +127,7 @@ impl Graphs {
             verify_integrity,
             graphs,
             acl_path: None,
+            acl_handle: None,
             require_acl_stamp: false,
             range_index_cache_bytes,
             degree_residency,
@@ -201,13 +202,34 @@ impl Graphs {
     /// flags stay co-located with the acl path. (MAC presence is not a policy
     /// knob: a keyed server unconditionally refuses a MAC-less generation — see
     /// `check_manifest_policy`.)
+    /// Bind the **in-force** ACL — the one `AclHandle` is actually serving.
+    ///
+    /// Without this, [`Self::live_acl_digest`] can only hash `acl.json` on disk, and those
+    /// two differ by design: `reload_checked` refuses a candidate that violates a served
+    /// generation's stamp and keeps the last-good serving. Comparing a generation's stamp
+    /// against a re-read of the file therefore asks "does the file agree with itself",
+    /// which any writer of that file can arrange (HIK-284).
+    pub fn set_in_force_acl(&mut self, acl: Arc<crate::acl::AclHandle>) {
+        self.acl_handle = Some(acl);
+    }
+
     pub fn set_manifest_policy(&mut self, acl_path: Option<PathBuf>, require_acl_stamp: bool) {
         self.acl_path = acl_path;
         self.require_acl_stamp = require_acl_stamp;
     }
 
-    /// Hash the configured live `acl.json` once, or `None` when no `acl_path` is set.
+    /// The digest of the ACL **in force**, or `None` when no ACL is configured.
+    ///
+    /// Prefers the bound [`AclHandle`] over hashing the file, because those diverge
+    /// whenever an edit has been refused: the handle keeps serving the last-good ACL while
+    /// `acl.json` holds something the server rejected. Checking a generation's stamp
+    /// against the file would let whoever wrote that file certify their own edit
+    /// (HIK-284). The file is used only before a handle is bound — at boot, where it *is*
+    /// the ACL about to be loaded.
     pub(crate) fn live_acl_digest(&self) -> Result<Option<String>> {
+        if let Some(h) = &self.acl_handle {
+            return Ok(Some(h.digest()));
+        }
         match &self.acl_path {
             Some(p) => Ok(Some(
                 graph_format::integrity::hash_file(p)
