@@ -93,6 +93,8 @@ that select which one is live:
     topology.csr.blk  node_degrees.blk  hub_degrees.blk
     reltype_src.post  reltype_tgt.post  prop_hist.blk
     <range-index files>  <label>.<prop>.vamana  <label>.<prop>.pq
+    fulltext/<name>.ftd  fulltext/<name>.ftm.blk
+    fulltext/<name>.post.blk  fulltext/<name>.docs.blk
   sets/<uuid>.json            # base + stacked segments (writable layer)
   segments/<uuid>/            # sealed delta segments (writable layer)
 ```
@@ -156,6 +158,12 @@ default) or `pinned` (prefault the whole column, never evict). See
 - Range (ISAM) index files — sorted business-key indexes.
 - `<label>.<prop>.vamana` + `.pq` — the vector ANN graph and PQ codes
   ([10 Vector search](10-vector-search.md)).
+- `fulltext/<name>.{ftd,ftm.blk,post.blk,docs.blk}` — one full-text index: the term
+  dictionary, the per-term metadata and skip list, the postings in fixed 128-document
+  chunks, and a document record per indexed entity (its id, its length norm, and for a
+  relationship index its endpoints). Written through the same block-file machinery as
+  everything else, so per-block encryption, integrity and compression apply unchanged
+  ([09 Procedures](09-procedures-and-algorithms.md)).
 
 ## Next
 

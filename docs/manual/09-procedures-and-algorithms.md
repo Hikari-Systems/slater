@@ -128,7 +128,9 @@ It also yields `labels` and `relTypes` (name→count maps), `relTypeCount`, and
 ```
 
 Range indexes report provider `range-1.0`; vector indexes appear as
-`vector_<label>_<property>` with provider `vector-2.0`. Slater enforces no
+`vector_<label>_<property>` with provider `vector-2.0`; full-text indexes appear as
+`fulltext_<name>` with type `FULLTEXT` and provider `fulltext-1.0`, their
+`entityType` being `NODE` or `RELATIONSHIP` according to what they index. Slater enforces no
 uniqueness/existence constraints, so `SHOW CONSTRAINTS` and `db.constraints()` are
 always empty.
 

@@ -7,7 +7,7 @@ immutable on-disk image with `slater-build`, then serve it with `slater` and
 query it over the Bolt protocol using any Neo4j-compatible driver.
 
 This manual is the how-to reference for **every** user-facing feature: the query
-language, the build toolchain, vector search, the writable layer, storage,
+language, the build toolchain, vector and full-text search, the writable layer, storage,
 deployment, configuration, security, and tuning. Each page follows the same
 shape — **what the feature is and why it exists**, then **how to use it** with
 worked examples, then a **reference** table of the exact syntax, flags, or knobs.
@@ -68,9 +68,12 @@ worked examples, then a **reference** table of the exact syntax, flags, or knobs
 - [09 Procedures & algorithms](09-procedures-and-algorithms.md) — the `CALL`
   surface, graph algorithms, and introspection.
 
-### Vectors & writes
+### Search & writes
 - [10 Vector search](10-vector-search.md) — embeddings, distance metrics, KNN,
   and the vector write ladder.
+- **Full-text search** — BM25 over declared node and relationship indexes, in
+  [05 Building graphs](05-building-graphs.md) (declaring them) and
+  [09 Procedures & algorithms](09-procedures-and-algorithms.md) (querying them).
 - [11 Writing data](11-writing-data.md) — the optional writable layer:
   inserts, updates, deletes, and consolidation.
 

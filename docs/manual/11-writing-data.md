@@ -188,10 +188,47 @@ MATCH (b:Person {email:'alan@example.com'})
 MERGE (a)-[r:KNOWS]->(b) SET r.since = 1936;
 ```
 
-Relationship writes take property assignments only (`SET r.p = value`), across as many
-`SET` clauses as you like. Whole-map assignment (`SET r = {…}`) is **not** accepted: an
-edge's durable op carries merge-semantics patches with no replace flag, so honouring it
-would silently merge where the statement says replace.
+Relationship writes take property assignments across as many `SET` clauses as you like,
+including the whole-map forms: `SET r = $map` **replaces** the edge's properties and
+`SET r += $map` merges over them. (Whole-map replace was once refused, because the durable
+op carried merge-semantics patches with no replace flag and honouring it would have
+silently merged where the statement said replace. The op now carries the flag.)
+
+A `RETURN` after a relationship write projects what it just wrote, resolved over the
+post-write view — so a `MERGE` that *created* the edge still projects it:
+
+```cypher
+MERGE (a:Person {email:'ada@example.com'})-[r:KNOWS]->(b:Person {email:'alan@example.com'})
+SET r.since = 1936
+RETURN r.since;
+```
+
+### An inline property can identify the relationship
+
+By default `MERGE (a)-[r:R]->(b)` means *any* `R` between that pair, so re-merging matches
+the existing edge. Giving the pattern one inline property makes that property the edge's
+**identity** instead:
+
+```cypher
+MERGE (a:Entity {uuid:$src})-[r:RELATES_TO {uuid:$edge}]->(b:Entity {uuid:$dst})
+SET r = $fact;
+```
+
+Two `RELATES_TO` edges between the same pair with different `uuid`s stay two distinct
+edges rather than collapsing into one — which is what a graph that records several facts
+about the same pair needs. The property reads back off the edge, survives a `SET r = $map`
+that omits it, and survives consolidation.
+
+A keyless `MERGE` still means "any `R`", so it adopts an edge already stored under an
+identifying property rather than standing beside it — the same statement pair answers the
+same way either side of a consolidation.
+
+Two things are refused rather than guessed at: **more than one inline property** (which
+one is the identity would be a guess), and a **keyed `DELETE`** —
+`MATCH (a)-[r:R {uuid:$u}]->(b) DELETE r`. The traversal overlay suppresses a core edge by
+`(type, neighbour)`, so it cannot spare that edge's siblings; deleting every `R` between
+the pair is exactly the loss identifying properties exist to prevent, so the parser says so
+instead.
 
 ## Batched writes with `UNWIND`
 
@@ -212,6 +249,21 @@ s.run(q, rows=[{"email": "margaret@example.com", "name": "Margaret Hamilton"},
 If any row fails to evaluate or resolve, the entire batch is rejected before
 commit.
 
+Relationships batch the same way, including the identifying-property form, and a
+`RETURN` may project a field of the row:
+
+```cypher
+UNWIND $edges AS edge
+MATCH (source:Entity {uuid: edge.source_uuid})
+MATCH (target:Entity {uuid: edge.target_uuid})
+MERGE (source)-[r:RELATES_TO {uuid: edge.uuid}]->(target)
+SET r = edge
+RETURN edge.uuid AS uuid
+```
+
+`DELETE` deliberately takes no `UNWIND` prefix, for the same reason a keyed `DELETE` is
+refused: a batched delete could not spare an edge's siblings either.
+
 ## What you cannot write
 
 These are enforced with clear errors — they keep the served schema stable:
@@ -222,7 +274,8 @@ These are enforced with clear errors — they keep the served schema stable:
 | Write a relationship type not in the graph | rejected — the type must already exist |
 | `MERGE`/`CREATE` on a non-range-indexed key | rejected — add a range index at build time |
 | `DELETE` a node that still has relationships | rejected — use `DETACH DELETE` |
-| `RETURN` after a relationship write | rejected — run a separate `MATCH … RETURN` |
+| `DELETE` naming an inline edge property (`DELETE r` on `-[r:R {uuid:$u}]->`) | rejected — the overlay cannot spare the edge's siblings; see above |
+| More than one inline property on a relationship pattern | rejected — which one is the identity would be a guess |
 
 New labels and relationship types come only from a rebuild; the writable layer
 works within the schema the base generation already defines.
@@ -234,6 +287,20 @@ acknowledgement barrier, so a returned write is durable. Bolt `BEGIN`/`COMMIT` i
 accepted but only opens a **read** transaction; there is no multi-statement write
 transaction. Concurrent writes to one graph serialise behind that graph's writer
 (bounded by `server.maxConcurrentWrites`, default 4).
+
+## When a write is refused for reasons that are not about the statement
+
+Two failures come from the *state of the server* rather than from the Cypher, and both are
+loud on purpose:
+
+| Message | Meaning |
+|---|---|
+| `the writable layer is bound to generation X but graph 'g' is now serving Y … has NOT been applied` | A new generation was swapped in under the writer, so the delta's internal ids no longer line up. The write was **not** applied. Consolidate or restart to rebind the delta. |
+| `refusing to swap graph 'g' to generation X: the writable layer holds N pending entities …` | The generation guard found a new generation on disk while the delta held unconsolidated writes, and kept the current one serving rather than abandoning them. Run `CALL slater.consolidate()`, then publish again. |
+
+The second is why publishing a new generation under a live writable server does not
+silently discard the delta. If you are republishing deliberately — a schema rebuild, say —
+consolidate first so the delta is folded in, or stop the server.
 
 ## Consolidation
 
@@ -256,6 +323,26 @@ consolidation failed: … spawn builder 'slater-build': No such file or director
 Consolidation can also run automatically on a size trigger or an off-peak window
 (`delta.deltaCorePercent`, `delta.consolidateWindow`); see
 [14 Configuration reference](14-configuration-reference.md).
+
+### Consolidation and the ACL stamp
+
+On a graph built with `--acl`, the rebuild is stamped with the ACL the server is
+**enforcing** — the one it loaded and is serving, not whatever `acl.json` happens to
+contain when the rebuild runs. If the file has changed underneath, the consolidation is
+refused rather than blessing it:
+
+```
+refusing to consolidate 'g': /etc/slater/acl.json hashes to <b> but the ACL in force
+is <a>. The rebuild would be stamped against an acl.json this server never accepted…
+```
+
+That is the stamp doing its job. An edit to `acl.json` takes effect when the server adopts
+it through the stamp gate ([15 Security](15-security.md)), not because a rebuild happened
+to read the file mid-edit. Restore the file, or restart so the new ACL is adopted, then
+consolidate.
+
+If a rebuild is refused at swap-in for any reason, the `current` pointer is rolled back to
+the generation still serving, so a failed consolidation leaves a bootable graph.
 
 ## Next
 

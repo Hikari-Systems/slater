@@ -125,6 +125,12 @@ the layering); it takes no CLI flags.
 | `vectorQuery.rwIndex.minVectors` | `2000` | Floor below which the delta arm stays brute-force. |
 | `vectorQuery.rwIndex.maxVectors` | `50000` | Ceiling above which the delta refuses an in-memory index. |
 
+## `fulltext.*`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `fulltext.maxHits` | `10000` | Ceiling on the rows one `db.idx.fulltext.query*` call returns. There is no `k` argument on the procedure, so this is what bounds it; use `LIMIT` to take fewer. |
+
 ## `encryption.*`
 
 | Key | Default | Purpose |

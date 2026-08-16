@@ -84,7 +84,9 @@ A few concepts recur throughout the manual:
   language is a large, compatible subset ([07 Querying](07-querying.md)); the
   administrative surface is Slater's own.
 - It does **not** compute embeddings. You supply vectors; Slater indexes and
-  searches them ([10 Vector search](10-vector-search.md)).
+  searches them ([10 Vector search](10-vector-search.md)). It does index **text**
+  itself, for BM25 full-text search over labels and relationship types declared at
+  build time ([09 Procedures](09-procedures-and-algorithms.md)).
 - It does **not** enforce schema constraints (uniqueness, existence). Identity
   comes from business keys you define at build time
   ([03 Data model](03-data-model.md)).
