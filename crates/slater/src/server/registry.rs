@@ -750,7 +750,13 @@ impl Graphs {
         // The stamp the child actually wrote, checked against the ACL in force *before* the
         // generation is adopted — so a rebuild against bytes the server never accepted is
         // never served, even for an instant.
-        if let Some(pin) = acl_pin {
+        // Only when this server actually configures an ACL. `acl_pin` comes from the
+        // connection's `AclHandle`, which always exists; whether the *rebuild* is told to
+        // stamp comes from `acl_path`, which may not be set. Enforcing the pin without it
+        // refuses every consolidation on a server that has no ACL policy at all — the
+        // child was never asked to stamp, so of course the stamp is absent. Caught by the
+        // real-builder CI job, which is the only place a genuine `slater-build` runs.
+        if let (Some(pin), true) = (acl_pin, acl_for_build.is_some()) {
             let published = Generation::current_uuid_in(self.store.as_ref(), name)?;
             let candidate = Generation::open_with_store_opts_cached(
                 self.store.as_ref(),
