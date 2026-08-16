@@ -204,22 +204,23 @@ fn consolidation_folds_a_flushed_l0_level() {
     let new_uuid = uuid::Uuid::from_u128(0x4c0b_0000_0000_0000_0000_0000_0000_0001);
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
-    let build = |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
-        let nodes = dump_nodes(dump);
-        assert!(
-            nodes.contains_key("Dave"),
-            "the flushed born node must be in the dump: {:?}",
-            nodes.keys().collect::<Vec<_>>()
-        );
-        assert_eq!(
-            dump_age(dump, "Alice"),
-            Some(99),
-            "the flushed core patch must be in the dump"
-        );
-        assert_eq!(g, "people");
-        testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
-        Ok(())
-    };
+    let build =
+        |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>, _acl: Option<&Path>| -> Result<()> {
+            let nodes = dump_nodes(dump);
+            assert!(
+                nodes.contains_key("Dave"),
+                "the flushed born node must be in the dump: {:?}",
+                nodes.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                dump_age(dump, "Alice"),
+                Some(99),
+                "the flushed core patch must be in the dump"
+            );
+            assert_eq!(g, "people");
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            Ok(())
+        };
     let published = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap();
@@ -267,9 +268,10 @@ fn failed_consolidation_preserves_the_write_and_old_core() {
 
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
-    let build = |_d: &Path, _g: &str, _dd: &Path, _k: Option<&[u8]>| -> Result<()> {
-        bail!("simulated builder crash")
-    };
+    let build =
+        |_d: &Path, _g: &str, _dd: &Path, _k: Option<&[u8]>, _acl: Option<&Path>| -> Result<()> {
+            bail!("simulated builder crash")
+        };
     let err = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap_err();
@@ -371,18 +373,19 @@ fn consolidation_retires_the_delta_when_the_guard_wins_the_swap() {
     let vc = VectorIndexCache::new(1 << 20);
 
     let new_uuid = uuid::Uuid::from_u128(0x_8900_0000_0000_0000_0000_0000_0000_0001);
-    let build = |_d: &Path, _g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
-        testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
-        // The guard's poll lands here — after the builder published `current`, before
-        // the consolidation swaps the served slot onto it — and wins the swap.
-        let swapped = guard_swap(&graphs, "people", &vc).unwrap();
-        assert_eq!(
-            swapped.map(|g| g.0),
-            Some(new_uuid),
-            "the guard swapped the consolidation's generation in first"
-        );
-        Ok(())
-    };
+    let build =
+        |_d: &Path, _g: &str, dd: &Path, _key: Option<&[u8]>, _acl: Option<&Path>| -> Result<()> {
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            // The guard's poll lands here — after the builder published `current`, before
+            // the consolidation swaps the served slot onto it — and wins the swap.
+            let swapped = guard_swap(&graphs, "people", &vc).unwrap();
+            assert_eq!(
+                swapped.map(|g| g.0),
+                Some(new_uuid),
+                "the guard swapped the consolidation's generation in first"
+            );
+            Ok(())
+        };
     let published = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap();
@@ -440,28 +443,29 @@ fn guard_sweep_defers_to_an_in_flight_consolidation() {
 
     let new_uuid = uuid::Uuid::from_u128(0x_8900_0000_0000_0000_0000_0000_0000_0002);
     let gen0_for_build = gen0.clone();
-    let build = |_d: &Path, _g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
-        testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
-        // `current` has moved, and the consolidation has not yet swapped. A guard poll
-        // landing here must defer on both strategies.
-        assert!(matches!(
-            guard_sweep(&graphs, &vc, ReloadStrategy::Swap, None),
-            SweepAction::Continue
-        ));
-        assert_eq!(
-            graphs.get("people").unwrap().uuid(),
-            gen0_for_build.uuid(),
-            "the guard left the swap to the in-flight consolidation"
-        );
-        assert!(
-            matches!(
-                guard_sweep(&graphs, &vc, ReloadStrategy::Exit, None),
+    let build =
+        |_d: &Path, _g: &str, dd: &Path, _key: Option<&[u8]>, _acl: Option<&Path>| -> Result<()> {
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            // `current` has moved, and the consolidation has not yet swapped. A guard poll
+            // landing here must defer on both strategies.
+            assert!(matches!(
+                guard_sweep(&graphs, &vc, ReloadStrategy::Swap, None),
                 SweepAction::Continue
-            ),
-            "reloadStrategy=exit must not shut the process down over our own publish"
-        );
-        Ok(())
-    };
+            ));
+            assert_eq!(
+                graphs.get("people").unwrap().uuid(),
+                gen0_for_build.uuid(),
+                "the guard left the swap to the in-flight consolidation"
+            );
+            assert!(
+                matches!(
+                    guard_sweep(&graphs, &vc, ReloadStrategy::Exit, None),
+                    SweepAction::Continue
+                ),
+                "reloadStrategy=exit must not shut the process down over our own publish"
+            );
+            Ok(())
+        };
     let published = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap();
@@ -542,8 +546,8 @@ fn a_production_consolidation_honours_non_default_builder_limits() {
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
     let new = graphs
-        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, key| {
-            run_builder(&bin, d, g, dd, key, limits, None)
+        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, key, _acl| {
+            run_builder(&bin, d, g, dd, key, limits, None, None)
         })
         .expect("the real builder must accept the flags the server sends");
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
@@ -604,7 +608,7 @@ fn consolidate_via_real_builder() {
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
     let new = graphs
-        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, _key| {
+        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, _key, _acl| {
             let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
                 .unwrap()
             {
@@ -619,7 +623,7 @@ fn consolidate_via_real_builder() {
                 TEST_BOLT_VERSION,
             )
             .unwrap();
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
@@ -716,8 +720,8 @@ fn consolidate_carries_vector_indexes_and_embeddings() {
     .unwrap();
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
 
@@ -777,8 +781,8 @@ fn consolidate_carries_a_delta_written_vector_over_the_base() {
     drop(gen0);
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
 
@@ -904,8 +908,8 @@ fn a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding() {
 
     // 3. A background consolidation, run while d00 is out of scope.
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
     assert_eq!(
@@ -992,8 +996,8 @@ fn a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation()
     vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) REMOVE n:Doc");
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
 
@@ -1049,8 +1053,8 @@ fn a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding() {
 
     // A consolidation while out of scope.
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key, _acl| {
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
 
@@ -1208,7 +1212,7 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     drop(gen0);
 
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key, _acl| {
             // HIK-149: this graph carries a Vamana index, so its dump has a vector-carry
             // sidecar as well as the four base files — the one dump shape the marker test
             // below cannot reach.
@@ -1284,7 +1288,7 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     // is still `vector/Doc.embedding.vamana`. If the subkey were inferred from the path this
     // is the consolidation that would fail.
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key, _acl| {
             // HIK-149: this graph carries a Vamana index, so its dump has a vector-carry
             // sidecar as well as the four base files — the one dump shape the marker test
             // below cannot reach.
@@ -1437,4 +1441,69 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     );
 
     std::fs::remove_dir_all(&work).ok();
+}
+
+// ── HIK-283: a rebuild must carry the ACL stamp forward ──────────────────────
+
+/// The consolidation rebuild must be told which ACL to stamp against.
+///
+/// `run_builder` passed the data dir, the graph and the encryption key but not `--acl`,
+/// and `slater-build` writes `aclBlake3` only when given it. So the rebuilt manifest was
+/// unstamped, `check_manifest_policy` refused it under `requireAclStamp`, and `current`
+/// was left naming a generation the server would not open — which under the default
+/// `reloadStrategy = exit` means the graph does not come back up.
+///
+/// Asserted at the seam rather than end to end, so it runs in the normal suite: the
+/// end-to-end path needs the real builder binary and is `#[ignore]`d. What is pinned is
+/// that the server hands its configured ACL path to whatever performs the rebuild — the
+/// exact thing that was missing.
+#[test]
+fn consolidation_hands_the_configured_acl_to_the_builder() {
+    let (root, _graph) = testgen::write_indexed_people("hik283_acl_passthrough");
+    let wal = root.join("_wal");
+    let acl_path = write_acl(&root);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    graphs.set_manifest_policy(Some(acl_path.clone()), true);
+
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+    let writer = graphs.writer("people").unwrap();
+    let w = match parser::parse_statement("MERGE (n:Person {name:'Ada'}) SET n.age = 41").unwrap() {
+        parser::ast::Statement::Write(w) => w,
+        _ => unreachable!(),
+    };
+    execute_write(
+        &writer,
+        graphs.get("people").unwrap().as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+
+    // Record what the builder was handed, then fail the build — the assertion is about
+    // the arguments, and failing keeps the test from needing a real rebuild.
+    let seen: std::sync::Mutex<Option<Option<PathBuf>>> = std::sync::Mutex::new(None);
+    let build = |_d: &Path, _g: &str, _dd: &Path, _k: Option<&[u8]>, acl: Option<&Path>| {
+        *seen.lock().unwrap() = Some(acl.map(|p| p.to_path_buf()));
+        anyhow::bail!("stop here: the arguments are what this test is about")
+    };
+    let _ = graphs.consolidate_graph("people", &cache, &vc, &root, build);
+
+    let handed = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the builder was never invoked");
+    assert_eq!(
+        handed,
+        Some(acl_path),
+        "the rebuild must be stamped with the ACL the server enforces, or the generation \
+         it publishes is refused by the very policy that server is running"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }

@@ -269,3 +269,181 @@ async fn exit_strategy_guard_task_signals_shutdown_over_oneshot() {
     assert_eq!(reason, "people");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── HIK-282: a swap must not orphan a live delta ─────────────────────────────
+
+/// A write must never be acknowledged and then be unreadable.
+///
+/// `delta_for_read` fails safe to the pure core when the writer's delta was resolved
+/// against a superseded generation, and its comment called that "defence in depth"
+/// because Phase 1c ran with `reloadStrategy = exit`. Under `swap` that path is the
+/// *primary* one, and it was silent: reads fell back to core while the write path kept
+/// accepting statements into the orphaned delta, returning their `RETURN` rows. The
+/// client is told the write succeeded and the row is gone.
+///
+/// The assertion is deliberately the weaker of the two available — *either* the write
+/// fails *or* it reads back — because it must hold whichever way the fix goes: refusing
+/// the swap while a delta is bound, or refusing the write into an orphaned one. What it
+/// rules out is the third outcome, which is the bug.
+#[test]
+fn a_write_after_a_generation_swap_is_never_silently_lost() {
+    let (root, _graph) = testgen::write_indexed_people("hik282_swap_orphan");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let graphs = Arc::new(graphs);
+    let vc = VectorIndexCache::new(1 << 20);
+    let writer = graphs.writer("people").unwrap();
+
+    let stmt = |q: &str| match parser::parse_statement(q).unwrap() {
+        parser::ast::Statement::Write(w) => w,
+        _ => unreachable!("not a write: {q}"),
+    };
+    // Does the merged view — what a reader actually sees — hold this person?
+    let visible = |name: &str| -> bool {
+        let gen = graphs.get("people").unwrap();
+        let overlay = crate::server::write::delta_for_read(&writer, &gen);
+        let view = MergedView::new(gen.as_ref(), overlay.delta);
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&view, &cache);
+        let ast = parser::parse(&format!(
+            "MATCH (n:Person {{name:'{name}'}}) RETURN n.name AS name"
+        ))
+        .unwrap();
+        !engine.run(&ast).unwrap().rows.is_empty()
+    };
+
+    // A write into the live delta, readable — the control. Without this the test could
+    // pass against a harness that never wrote anything.
+    {
+        let gen = graphs.get("people").unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt("MERGE (n:Person {name:'Ada'}) SET n.age = 41"),
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
+    }
+    assert!(visible("Ada"), "control: a delta write must be readable");
+
+    // A new generation is published under the live server — an ordinary republish.
+    publish_copy_as_new_generation(&root, "people", None);
+    let swapped = guard_swap(&graphs, "people", &vc);
+
+    // Now the statement the client believes succeeded.
+    let gen = graphs.get("people").unwrap();
+    let wrote = execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt("MERGE (n:Person {name:'Grace'}) SET n.age = 45"),
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    );
+
+    if wrote.is_ok() {
+        assert!(
+            visible("Grace"),
+            "a write was acknowledged and is unreadable — swap result was {swapped:?}. \
+             Either the swap must be refused while a delta is bound to the live \
+             generation, or the write into an orphaned delta must fail."
+        );
+    }
+    // Whatever happened to the new write, the earlier one must not have vanished either.
+    assert!(
+        visible("Ada"),
+        "a write that was readable before the swap is now gone — swap result {swapped:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The guard refuses the swap, and says what to do about it.
+///
+/// The refusal is the primary fix: the current generation keeps serving, exactly as it
+/// does for a corrupt or policy-violating one. A message that only said "refused" would
+/// leave an operator stuck, so it names the pending count and the remedy.
+#[test]
+fn the_guard_refuses_to_swap_out_from_under_a_live_delta() {
+    let (root, _graph) = testgen::write_indexed_people("hik282_refuse");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let graphs = Arc::new(graphs);
+    let vc = VectorIndexCache::new(1 << 20);
+    let writer = graphs.writer("people").unwrap();
+    let before = graphs.get("people").unwrap().uuid();
+
+    let w = match parser::parse_statement("MERGE (n:Person {name:'Ada'}) SET n.age = 41").unwrap() {
+        parser::ast::Statement::Write(w) => w,
+        _ => unreachable!(),
+    };
+    execute_write(
+        &writer,
+        graphs.get("people").unwrap().as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+
+    publish_copy_as_new_generation(&root, "people", None);
+    let err = guard_swap(&graphs, "people", &vc).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("refusing to swap") && msg.contains("slater.consolidate"),
+        "the refusal must name the remedy, got: {msg}"
+    );
+    assert_eq!(
+        graphs.get("people").unwrap().uuid(),
+        before,
+        "the current generation must keep serving"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The backstop: if a delta is ever orphaned by a path the guard does not own, the write
+/// fails rather than being acknowledged. Driven through the bare `swap_locked`, which is
+/// the writer-side path and deliberately carries no refusal of its own.
+#[test]
+fn a_write_into_an_orphaned_delta_fails_instead_of_vanishing() {
+    let (root, _graph) = testgen::write_indexed_people("hik282_orphan_write");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let graphs = Arc::new(graphs);
+    let vc = VectorIndexCache::new(1 << 20);
+    let writer = graphs.writer("people").unwrap();
+
+    publish_copy_as_new_generation(&root, "people", None);
+    {
+        let _swap = graphs.swap_lock("people").unwrap();
+        graphs.swap_locked("people", &vc).unwrap();
+    }
+
+    let w = match parser::parse_statement("MERGE (n:Person {name:'Grace'}) SET n.age = 45").unwrap()
+    {
+        parser::ast::Statement::Write(w) => w,
+        _ => unreachable!(),
+    };
+    let e = execute_write(
+        &writer,
+        graphs.get("people").unwrap().as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap_err();
+    assert!(
+        e.message.contains("has NOT been applied"),
+        "the client must be told the write did not land, got: {}",
+        e.message
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

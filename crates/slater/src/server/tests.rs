@@ -705,7 +705,7 @@ impl Default for TestLimits {
 /// including inside another operation's publish window.
 fn guard_swap(graphs: &Graphs, name: &str, vc: &VectorIndexCache) -> Result<Option<GenId>> {
     let _swap = graphs.swap_lock(name)?;
-    graphs.swap_locked(name, vc)
+    graphs.swap_locked_guard(name, vc)
 }
 
 /// Re-embed a `:Doc` fixture node onto `vector`, through a bound `vecf32($v)`.

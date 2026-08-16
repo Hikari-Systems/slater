@@ -284,7 +284,7 @@ pub(crate) async fn execute_consolidate(
             &cache,
             &vector_cache,
             &data_dir,
-            |dump, g, dd, key| {
+            |dump, g, dd, key, acl| {
                 run_builder(
                     &builder_bin,
                     dump,
@@ -293,6 +293,7 @@ pub(crate) async fn execute_consolidate(
                     key,
                     builder_limits,
                     builder_key_env.as_deref(),
+                    acl,
                 )
             },
         )

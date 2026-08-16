@@ -53,35 +53,36 @@ fn consolidate_folds_delta_into_fresh_generation() {
     let vc = VectorIndexCache::new(1 << 20);
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
-    let build = |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
-        assert_eq!(
-            dump_age(dump, "Alice"),
-            Some(99),
-            "dump should carry the merged age"
-        );
-        assert_ne!(
-            dump_age(dump, "Bob"),
-            Some(77),
-            "the post-freeze write (Bob age 77) must not be in the frozen dump"
-        );
-        assert_eq!(g, "people");
-        let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
-            .unwrap()
-        {
-            parser::ast::Statement::Write(w) => w,
-            _ => unreachable!(),
+    let build =
+        |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>, _acl: Option<&Path>| -> Result<()> {
+            assert_eq!(
+                dump_age(dump, "Alice"),
+                Some(99),
+                "dump should carry the merged age"
+            );
+            assert_ne!(
+                dump_age(dump, "Bob"),
+                Some(77),
+                "the post-freeze write (Bob age 77) must not be in the frozen dump"
+            );
+            assert_eq!(g, "people");
+            let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
+                .unwrap()
+            {
+                parser::ast::Statement::Write(w) => w,
+                _ => unreachable!(),
+            };
+            execute_write(
+                &writer_mid,
+                gen_mid.as_ref(),
+                &bob,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .unwrap();
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            Ok(())
         };
-        execute_write(
-            &writer_mid,
-            gen_mid.as_ref(),
-            &bob,
-            &HashMap::new(),
-            TEST_BOLT_VERSION,
-        )
-        .unwrap();
-        testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
-        Ok(())
-    };
     let published = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap();
@@ -354,40 +355,41 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
     let writer = graphs.writer("people").unwrap();
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
-    let build = |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
-        let nodes = dump_nodes(dump);
-        assert_eq!(
-            dump_age(dump, "Alice"),
-            Some(99),
-            "dump carries the segment patch"
-        );
-        assert!(
-            !nodes.contains_key("Carol"),
-            "dump reclaimed the segment tombstone"
-        );
-        assert_eq!(
-            dump_age(dump, "Dave"),
-            Some(50),
-            "dump carries the segment-born node"
-        );
-        assert_eq!(g, "people");
-        let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
-            .unwrap()
-        {
-            parser::ast::Statement::Write(w) => w,
-            _ => unreachable!(),
+    let build =
+        |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>, _acl: Option<&Path>| -> Result<()> {
+            let nodes = dump_nodes(dump);
+            assert_eq!(
+                dump_age(dump, "Alice"),
+                Some(99),
+                "dump carries the segment patch"
+            );
+            assert!(
+                !nodes.contains_key("Carol"),
+                "dump reclaimed the segment tombstone"
+            );
+            assert_eq!(
+                dump_age(dump, "Dave"),
+                Some(50),
+                "dump carries the segment-born node"
+            );
+            assert_eq!(g, "people");
+            let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
+                .unwrap()
+            {
+                parser::ast::Statement::Write(w) => w,
+                _ => unreachable!(),
+            };
+            execute_write(
+                &writer_mid,
+                gen_mid.as_ref(),
+                &bob,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .unwrap();
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            Ok(())
         };
-        execute_write(
-            &writer_mid,
-            gen_mid.as_ref(),
-            &bob,
-            &HashMap::new(),
-            TEST_BOLT_VERSION,
-        )
-        .unwrap();
-        testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
-        Ok(())
-    };
     let published = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap();
@@ -654,7 +656,12 @@ fn gc_after_retarget_reclaims_the_prior_set() {
 
     // Retarget to a singleton via an injected builder that publishes a fresh generation.
     let new_uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0072);
-    let build = |_dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
+    let build = |_dump: &Path,
+                 g: &str,
+                 dd: &Path,
+                 _key: Option<&[u8]>,
+                 _acl: Option<&Path>|
+     -> Result<()> {
         assert_eq!(g, "people");
         testgen::write_indexed_people_at(dd, new_uuid, [30, 25, 40]);
         Ok(())

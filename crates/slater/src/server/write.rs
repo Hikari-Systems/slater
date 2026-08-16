@@ -823,6 +823,36 @@ pub(crate) async fn execute_write_off_reactor(
 /// group commit. A statement lowers to several ops only when it mixes a replace-all with
 /// further SET items; they commit atomically. Returns the `RETURN` projection when the
 /// statement carries one, and an empty result otherwise.
+/// Refuse a write whose delta is no longer bound to the generation being served.
+///
+/// **HIK-282.** The delta's dense ids are resolved against one specific core, so once a
+/// new generation is swapped in, `delta_for_read` correctly serves the pure core rather
+/// than mis-overlaying. What was missing is the other half: the write path went on
+/// accepting statements into that orphaned delta and returning their `RETURN` rows, so a
+/// client was told a write succeeded and the row was unreadable by the very next query.
+///
+/// A read served as pure core is defensible. An acknowledged unreadable write is not, so
+/// this fails loudly instead. The generation guard now refuses to create this state at
+/// all (`Graphs::swap_locked_guard`); this is the backstop for the paths it does not
+/// own, and for anything that reaches a writer bound to a retired core.
+fn refuse_orphaned_delta(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+) -> std::result::Result<(), Failure> {
+    if writer.core_uuid() == gen.uuid() {
+        return Ok(());
+    }
+    Err(Failure::new(
+        CODE_EXECUTION,
+        format!(
+            "the writable layer is bound to generation {} but graph '{}' is now serving              {} — this write cannot be made durable against the served generation and              has NOT been applied. Consolidate or restart the server to rebind the              delta.",
+            writer.core_uuid().0,
+            gen.graph(),
+            gen.uuid().0,
+        ),
+    ))
+}
+
 pub(crate) fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
@@ -831,6 +861,7 @@ pub(crate) fn execute_write(
     version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     use parser::ast::WriteOp;
+    refuse_orphaned_delta(writer, gen)?;
     // A leading `UNWIND <list> AS r` is a batched (group-committed) write.
     if stmt.unwind.is_some() {
         return execute_write_batch(writer, gen, stmt, params, version);
@@ -1277,6 +1308,7 @@ pub(crate) fn execute_write_batch(
     params: &HashMap<String, Val>,
     version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    refuse_orphaned_delta(writer, gen)?;
     use parser::ast::{Expr, WriteOp};
     let (source, var) = stmt
         .unwind

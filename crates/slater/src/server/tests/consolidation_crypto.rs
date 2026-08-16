@@ -76,9 +76,9 @@ fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_gener
     // scratch dump directory, which is the one moment it exists on disk, so HIK-149's
     // assertion goes here: on an encrypted graph the dump must be sealed too.
     let new_uuid = graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k, _acl| {
             assert_dump_is_sealed(d);
-            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default(), None)
+            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default(), None, None)
         })
         .expect("a consolidation of an encrypted graph must succeed");
     assert_ne!(
@@ -181,9 +181,9 @@ fn a_key_env_consolidation_forwards_the_variable_and_publishes_an_encrypted_gene
     // `Some(VAR)` is the production wiring for a `keyEnv` deployment: no stdin is piped,
     // and the builder resolves the key from the environment it inherited.
     let new_uuid = graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k, _acl| {
             assert_dump_is_sealed(d);
-            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default(), Some(VAR))
+            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default(), Some(VAR), None)
         })
         .expect("a keyEnv-routed consolidation must succeed");
     assert_ne!(
@@ -268,35 +268,38 @@ fn a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph() {
     let vc = VectorIndexCache::new(1 << 22);
 
     // …consolidated by a build that has suddenly been given `--encrypt`.
-    let err = match graphs.consolidate_graph("docs", &cache, &vc, &data, |d, _g, _dd, _key| {
-        let st = std::process::Command::new(&bin)
-            .arg("--input")
-            .arg(d)
-            .args(["--input-format", "slater-dump"])
-            .args(["--graph", "docs"])
-            .args(["--data-dir", data.to_str().unwrap()])
-            .args(["--ann-threshold", "50"])
-            .args(["--pq-subspaces", "8"])
-            .args(["--pq-bits", "8"])
-            .arg("--encrypt")
-            .args(["--key-env", "SLATER_HIK145_MIXED_KEY"])
-            .env(
-                "SLATER_HIK145_MIXED_KEY",
-                "0123456789abcdef0123456789abcdef",
-            )
-            .status()
-            .context("spawn builder")?;
-        anyhow::ensure!(
-            st.success(),
-            "keyed build over a plaintext base failed: {st}"
-        );
-        Ok(())
-    }) {
-        Ok(_) => {
-            panic!("a keyed build must not carry a plaintext vector graph into an encrypted image")
-        }
-        Err(e) => e,
-    };
+    let err =
+        match graphs.consolidate_graph("docs", &cache, &vc, &data, |d, _g, _dd, _key, _acl| {
+            let st = std::process::Command::new(&bin)
+                .arg("--input")
+                .arg(d)
+                .args(["--input-format", "slater-dump"])
+                .args(["--graph", "docs"])
+                .args(["--data-dir", data.to_str().unwrap()])
+                .args(["--ann-threshold", "50"])
+                .args(["--pq-subspaces", "8"])
+                .args(["--pq-bits", "8"])
+                .arg("--encrypt")
+                .args(["--key-env", "SLATER_HIK145_MIXED_KEY"])
+                .env(
+                    "SLATER_HIK145_MIXED_KEY",
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .status()
+                .context("spawn builder")?;
+            anyhow::ensure!(
+                st.success(),
+                "keyed build over a plaintext base failed: {st}"
+            );
+            Ok(())
+        }) {
+            Ok(_) => {
+                panic!(
+                    "a keyed build must not carry a plaintext vector graph into an encrypted image"
+                )
+            }
+            Err(e) => e,
+        };
     // The refusal happens inside the builder, so it reaches the server as a failed build.
     // Which of the two gates fires is not the property under test — in practice the earlier
     // one does, because a keyed build authenticating the plaintext base generation's
@@ -393,8 +396,8 @@ fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
     let base_bytes = std::fs::read(&base_vamana).expect("base .vamana must exist");
 
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key, _acl| {
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None, None)
         })
         .unwrap();
 

@@ -353,6 +353,58 @@ impl Graphs {
     /// this pointer change mine to apply? [`Self::adopt_published_generation`]: which
     /// generation is served now?), so they take the lock themselves and call this body
     /// rather than a self-locking wrapper (a std `Mutex` is not reentrant).
+    /// [`Self::swap_locked`], with the refusal the **background generation guard** needs.
+    ///
+    /// **HIK-282.** A generation swap rebinds what is served, but not the write delta —
+    /// its dense ids were resolved against the core it was opened on. Swapping out from
+    /// under a live delta therefore abandons it: reads fall back to pure core, and the
+    /// writes that follow were accepted, acknowledged, and unreadable. Silent, and the
+    /// trigger is ordinary — any republish under a running server.
+    ///
+    /// So the guard refuses instead. The current generation keeps serving, exactly as it
+    /// does for a corrupt or policy-violating one, and the operator consolidates — which
+    /// retires the delta coherently — before the new generation can take over.
+    ///
+    /// This is deliberately **not** in [`Self::swap_locked`] itself. The writer-side
+    /// publish path ([`Self::adopt_published_generation`]) swaps precisely *because* it
+    /// has just folded the delta it owns, and must not be refused by a guard meant for
+    /// the poller.
+    pub(crate) fn swap_locked_guard(
+        &self,
+        name: &str,
+        vector_cache: &VectorIndexCache,
+    ) -> Result<Option<GenId>> {
+        if let Some(writer) = self.writer(name) {
+            let live = self
+                .graphs
+                .get(name)
+                .ok_or_else(|| anyhow!("graph '{name}' is not served"))?
+                .read()
+                .unwrap()
+                .clone();
+            let on_disk = Generation::current_uuid_in(self.store.as_ref(), name)?;
+            let pending = writer.delta_entity_count();
+            // A consolidation in flight is the one case where swapping out from under a
+            // live delta is correct: that generation *is* the folded delta, and the op
+            // retires it immediately after. The guard polls the same `current` pointer and
+            // may reach it first — `adopt_published_generation` exists precisely because
+            // either may win — so refusing here would wedge the race the writer-side path
+            // is built to survive.
+            let consolidating = writer.is_consolidating();
+            if on_disk != live.uuid().0
+                && writer.core_uuid() == live.uuid()
+                && pending > 0
+                && !consolidating
+            {
+                bail!(
+                    "refusing to swap graph '{name}' to generation {on_disk}: the writable                      layer holds {pending} pending entities against the generation now                      served ({}), and a swap would abandon them. Run                      `CALL slater.consolidate()` to fold the delta into a new generation,                      then publish again.",
+                    live.uuid().0,
+                );
+            }
+        }
+        self.swap_locked(name, vector_cache)
+    }
+
     pub(crate) fn swap_locked(
         &self,
         name: &str,
@@ -474,7 +526,7 @@ impl Graphs {
     /// new generation is published and swapped in.
     ///
     /// # The `build` seam
-    /// `build(dump, graph, data_dir)` rebuilds `graph` from the `dump` file and
+    /// `build(dump, graph, data_dir, key, acl)` rebuilds `graph` from the `dump` file and
     /// publishes a fresh generation under `data_dir` (updating its `current`
     /// pointer). Production passes [`run_builder`] (spawns the configured
     /// `slater-build`); tests inject a closure that publishes a known-correct
@@ -488,7 +540,7 @@ impl Graphs {
         cache: &BlockCache,
         vector_cache: &VectorIndexCache,
         data_dir: &Path,
-        build: impl Fn(&Path, &str, &Path, Option<&[u8]>) -> Result<()>,
+        build: impl Fn(&Path, &str, &Path, Option<&[u8]>, Option<&Path>) -> Result<()>,
     ) -> Result<GenId> {
         let writer = self
             .writer(name)
@@ -612,7 +664,15 @@ impl Graphs {
         // supplied its own closure with `--encrypt --key-env`, so none of them exercised
         // the keyless invocation production actually made. Widening the signature makes a
         // test that ignores the key a deliberate act rather than an accident.
-        if let Err(e) = build(&dump_path, name, data_dir, master_key) {
+        // The ACL the server is enforcing, so the rebuild is stamped with it (HIK-283).
+        let acl_for_build = self.acl_path.clone();
+        if let Err(e) = build(
+            &dump_path,
+            name,
+            data_dir,
+            master_key,
+            acl_for_build.as_deref(),
+        ) {
             let _ = std::fs::remove_dir_all(&dump_path);
             return Err(e).with_context(|| format!("rebuild consolidated generation for '{name}'"));
         }
@@ -623,9 +683,53 @@ impl Graphs {
         // swapped it in already; `adopt_published_generation` reports what is served
         // either way, so the retire below runs whoever won the swap — it is *this* call's
         // to run, and skipping it would orphan the delta we just folded in.
-        let new_gen = self
+        //
+        // If the adopt is *refused* — the rebuilt generation violates the manifest policy,
+        // say — `current` has already been moved to it by the builder. Leaving it there
+        // turns a failed operation into an unbootable graph: the boot-time policy check
+        // applies the same rule to the same generation and the process exits, which under
+        // `reloadStrategy = exit` is a crash loop (HIK-283). So the pointer goes back to
+        // the generation that was serving before, which is by construction one the policy
+        // already accepted. Best effort, and loud when it cannot be done: a rollback
+        // failure leaves the operator exactly where they were, and they need to know.
+        let new_gen = match self
             .adopt_published_generation(name, vector_cache)
-            .with_context(|| format!("swap in consolidated generation for '{name}'"))?;
+            .with_context(|| format!("swap in consolidated generation for '{name}'"))
+        {
+            Ok(g) => g,
+            Err(e) => {
+                let live = self.get(name).map(|g| g.uuid().0);
+                match live {
+                    Some(prev) => match self.store.put(
+                        &join_key(name, "current"),
+                        format!("{prev}\n").as_bytes(),
+                        None,
+                    ) {
+                        Ok(()) => warn!(
+                            graph = name,
+                            generation = %prev,
+                            "consolidated generation refused; rolled `current` back to the \
+                             generation still serving"
+                        ),
+                        Err(re) => error!(
+                            graph = name,
+                            generation = %prev,
+                            error = %format!("{re:#}"),
+                            "consolidated generation refused AND `current` could not be rolled \
+                             back — it still names a generation this server will not open, so \
+                             the next restart will fail. Point it at the logged generation by \
+                             hand before restarting."
+                        ),
+                    },
+                    None => error!(
+                        graph = name,
+                        "consolidated generation refused and no generation is served to roll \
+                         `current` back to"
+                    ),
+                }
+                return Err(e);
+            }
+        };
         let new_uuid = new_gen.uuid();
         // Still the pre-consolidation core ⇒ the builder exited 0 without publishing
         // anything. Nothing was folded in, so bail *before* retire: the delta stays live.

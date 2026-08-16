@@ -646,6 +646,12 @@ fn wait_with_timeout(
 /// threads, started **before** the key is written to stdin. The child therefore always has
 /// a reader on both pipes and can never block on output while we block writing the key.
 /// The stdin handle is dropped — closing the pipe, signalling EOF — before the wait.
+// Eight arguments, past clippy's threshold. Kept positional rather than wrapped, in line
+// with the other long signatures in this crate — but note the shape the lint is warning
+// about is real here: `dump`, `data_dir` and `acl` are all paths, so a transposition
+// compiles. They are ordered input, destination, policy, and the ACL goes last beside the
+// other things the *server* imposes on the build rather than things the build consumes.
+#[allow(clippy::too_many_arguments)]
 pub fn run_builder(
     builder_bin: &str,
     dump: &Path,
@@ -654,6 +660,7 @@ pub fn run_builder(
     master_key: Option<&[u8]>,
     limits: BuilderLimits,
     key_env: Option<&str>,
+    acl: Option<&Path>,
 ) -> Result<()> {
     // Only meaningful together: `key_env` names where `master_key` came from.
     debug_assert!(key_env.is_none() || master_key.is_some());
@@ -674,6 +681,14 @@ pub fn run_builder(
             // failure message, instead of the inherited terminal where nothing read them.
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // HIK-283. `slater-build` writes `aclBlake3` only when given `--acl`, so without
+        // this the rebuild publishes an *unstamped* generation — which `check_manifest_policy`
+        // then refuses under `requireAclStamp`, leaving `current` pointing at a generation
+        // the server will not open. Carrying the flag forward keeps the invariant the stamp
+        // exists for: a generation and the ACL it was built against travel together.
+        if let Some(path) = acl {
+            cmd.arg("--acl").arg(path);
+        }
         if limits.max_memory_bytes > 0 {
             cmd.arg("--max-memory")
                 .arg(limits.max_memory_bytes.to_string());
@@ -840,7 +855,7 @@ fn guard_sweep(
             ReloadStrategy::Exit => return SweepAction::Shutdown(name),
             // We already hold the swap mutex, so call the locked body directly (a std
             // `Mutex` is not reentrant).
-            ReloadStrategy::Swap => match graphs.swap_locked(&name, vector_cache) {
+            ReloadStrategy::Swap => match graphs.swap_locked_guard(&name, vector_cache) {
                 Ok(Some(new)) => {
                     info!(graph = %name, generation = %new, "swapped to a new generation (reloadStrategy=swap)");
                     // Adopt the ACL published alongside the new generation — this is the
