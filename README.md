@@ -121,22 +121,12 @@ sample graph. Start there for anything beyond this overview.
 
 ## Using Slater as a Graphiti memory store
 
-[**graphiti-slater**](https://github.com/Hikari-Systems/graphiti-slater) is a small
-adapter that lets [Graphiti](https://github.com/getzep/graphiti) — the temporal
-knowledge-graph framework behind a number of agent memory stacks — store its graph in
-Slater.
-
-Graphiti ships drivers for two engines. Slater is neither, but it speaks Bolt and
-implements the same procedure surface one of those dialects uses, so the adapter is
-thin: it subclasses Graphiti's own driver, selects that dialect, and reroutes the one
-search leg that reads an embedding as a column — which Slater routes out of the property
-record into its vector store. Everything else is Graphiti's own queries, unchanged.
-
-The repository carries a [`docker-example/`](https://github.com/Hikari-Systems/graphiti-slater/tree/develop/docker-example)
-that runs the whole thing from a single clone, in two tiers: a graph plus a verification
-suite that needs **no API keys at all**, and — behind a compose profile — Graphiti's MCP
-server, ready to register with Claude Code. It is the fastest way to see hybrid retrieval
-(BM25 full text *and* vector similarity, both served by Slater) working end to end.
+[**graphiti-slater**](https://github.com/Hikari-Systems/graphiti-slater) is an adapter
+that lets [Graphiti](https://github.com/getzep/graphiti) store its temporal knowledge
+graph in Slater, with a runnable
+[`docker-example/`](https://github.com/Hikari-Systems/graphiti-slater/tree/develop/docker-example)
+— including exposing it to Claude Code as an MCP server. See that repository for how it
+works and how to run it.
 
 ## Running with Docker
 
