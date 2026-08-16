@@ -12,12 +12,13 @@
 
 **Shortcuts**
 
-|  |  |  |  |  |
-|:--|:--|:--|:--|:--|
-| [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) |
-| [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
-| [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) | [Performance](#performance) |
-| [License](#license) | [📖 Full manual](docs/manual/README.md) |  |  |  |
+|  |  |  |  |
+|:--|:--|:--|:--|
+| [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) |
+| [Running with Docker](#running-with-docker) | [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) |
+| [Mounts](#mounts) | [Configuration](#environment--configuration) | [ACL](#acl) | [Health check](#health-check) |
+| [Worked example](#worked-example) | [Development](#development) | [Performance](#performance) | [License](#license) |
+| [Graphiti memory store](#using-slater-as-a-graphiti-memory-store) | [📖 Full manual](docs/manual/README.md) |  |  |
 
 ## Why Slater exists
 
@@ -117,6 +118,25 @@ sample graph. Start there for anything beyond this overview.
   [Configuration reference](docs/manual/14-configuration-reference.md),
   [Security](docs/manual/15-security.md),
   [Performance tuning](docs/manual/16-performance-tuning.md).
+
+## Using Slater as a Graphiti memory store
+
+[**graphiti-slater**](https://github.com/Hikari-Systems/graphiti-slater) is a small
+adapter that lets [Graphiti](https://github.com/getzep/graphiti) — the temporal
+knowledge-graph framework behind a number of agent memory stacks — store its graph in
+Slater.
+
+Graphiti ships drivers for two engines. Slater is neither, but it speaks Bolt and
+implements the same procedure surface one of those dialects uses, so the adapter is
+thin: it subclasses Graphiti's own driver, selects that dialect, and reroutes the one
+search leg that reads an embedding as a column — which Slater routes out of the property
+record into its vector store. Everything else is Graphiti's own queries, unchanged.
+
+The repository carries a [`docker-example/`](https://github.com/Hikari-Systems/graphiti-slater/tree/develop/docker-example)
+that runs the whole thing from a single clone, in two tiers: a graph plus a verification
+suite that needs **no API keys at all**, and — behind a compose profile — Graphiti's MCP
+server, ready to register with Claude Code. It is the fastest way to see hybrid retrieval
+(BM25 full text *and* vector similarity, both served by Slater) working end to end.
 
 ## Running with Docker
 
