@@ -547,13 +547,15 @@ fn an_edited_relationship_is_scored_from_its_current_text() {
 ///
 /// So it is asserted through scores rather than through membership, and the terms are
 /// chosen so that the *wrong* lookup is observable. Two born edges carry one term each,
-/// of equal length: `alpha`, which one core KNOWS document carries (edge df = 1), and
-/// `zzq`, which nothing has ever carried (df = 0). A term already seen must be judged
-/// less rare, so `alpha` has to score **strictly lower** than `zzq`.
+/// of equal length: `shared`, which every core KNOWS document carries (edge df = 3), and
+/// `zzq`, which nothing has ever carried (df = 0). A common term must be judged common,
+/// so `shared` has to score **strictly lower** than `zzq` — 0.168 against 2.614.
 ///
-/// `shared` would have been the obvious choice and is the wrong one: it is carried by
-/// *every* core document, which drives its idf non-positive, and the overlay arm drops
-/// a document that scores <= 0. The edge simply vanished from the result.
+/// The first version of this test used `london`, a term the *node* index knows, and
+/// asserted the two scored equally. It had no teeth: `fulltext_index(Node, "KNOWS")`
+/// finds no index at all, so the wrong lookup also returns `df = 0` and the assertion
+/// held either way. Verified by mutation this time — forcing the kind back to `Node`
+/// makes both scores 2.614 and fails.
 ///
 /// The first version of this test used `london` — a term the *node* index knows — and
 /// asserted the two scored equally. It had no teeth: `fulltext_index(Node, "KNOWS")`
@@ -575,7 +577,7 @@ fn an_edge_query_scores_against_the_edge_index_not_the_node_index() {
                 Value::Str("Alice".into()),
                 Some(2),
                 Some(0),
-                [("fact".to_string(), Value::Str("alpha".into()))],
+                [("fact".to_string(), Value::Str("shared".into()))],
             );
             mem.upsert_edge(
                 "Person",
@@ -590,11 +592,11 @@ fn an_edge_query_scores_against_the_edge_index_not_the_node_index() {
                 [("fact".to_string(), Value::Str("zzq".into()))],
             );
         },
-        "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (alpha | zzq)') \
+        "CALL db.idx.fulltext.queryRelationships('KNOWS', ' (shared | zzq)') \
          YIELD relationship AS r, score RETURN id(r) AS eid, score ORDER BY eid",
     );
-    // `alpha` matches a core document too, so select the two born edges by id rather
-    // than by position: 5 carries `alpha`, 6 carries `zzq`.
+    // `shared` matches the core documents too, so select the two born edges by id rather
+    // than by position: 5 carries `shared`, 6 carries `zzq`.
     let score_of = |eid: i64| -> f64 {
         res.rows
             .iter()
@@ -608,9 +610,9 @@ fn an_edge_query_scores_against_the_edge_index_not_the_node_index() {
     let (common, unseen) = (score_of(5), score_of(6));
     assert!(
         common < unseen,
-        "`alpha` is already carried by a core document and must be judged less rare than \
+        "`shared` is carried by every core document and must be judged common against \
          `zzq`, which nothing carries; equal scores mean the document frequencies came \
-         from the wrong corpus: alpha={common}, zzq={unseen}"
+         from the wrong corpus: shared={common}, zzq={unseen}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

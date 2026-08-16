@@ -176,6 +176,12 @@ order they are declared in matters — a property's position is the field its te
 are indexed under, which is what lets a field-scoped query term resolve against a
 posting list instead of falling back to a scan.
 
+How text is split into terms — and the two rules that most often surprise, that `_` is
+not a separator and that non-ASCII punctuation is not either — is described under
+[09 Procedures](09-procedures-and-algorithms.md#how-text-becomes-terms). It matters here
+because the builder and the query path must agree, so choosing properties whose text
+tokenises the way you expect is a build-time decision.
+
 ```cypher
 -- The option-map form. `stopwords` are dropped at index time and at query time.
 CALL db.idx.fulltext.createNodeIndex(

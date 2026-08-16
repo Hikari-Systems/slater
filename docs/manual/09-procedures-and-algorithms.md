@@ -201,6 +201,55 @@ only because text stays an ordinary property; an embedding, which is routed out 
 the property record, needs the much larger machinery in
 [10 Vector search](10-vector-search.md).
 
+### How text becomes terms
+
+Both the builder and the query path run one analyzer, and they must agree — if they split
+text differently nothing errors, the term is simply never found and a search quietly
+returns less than it should.
+
+- **Separators** are ASCII whitespace plus
+  ``! " # $ % & ' ( ) * + , - . / : ; < = > ? @ [ \ ] ^ ` { | } ~``. Anything else is a
+  term character.
+- **`_` is not a separator.** `group_id` is one token, not two — which is what makes a
+  field filter like `(@group_id:"x")` resolvable at all.
+- **Non-ASCII punctuation is not a separator either.** A curly apostrophe or an em dash is
+  an ordinary term character, so `don't` written with U+2019 is one token while the same
+  word with an ASCII `'` is two. Surprising, and deliberate: the contract is the one
+  FalkorDB-dialect clients sanitise their queries against, and diverging would mean a query
+  split one way and an index built another.
+- **Case is folded at both ends**, so matching is case-insensitive.
+- **Stop words** declared on the index are dropped when it is built *and* when a query is
+  parsed, so a stop word cannot be searched for at all.
+- **There is no stemming.** `running` does not match `runs`. That is a recall limit rather
+  than a defect, and the format reserves a field for a stemmer so adding one later is not
+  a rebuild of the format.
+
+### What `score` means
+
+BM25 with the textbook constants — `k1 = 1.2`, `b = 0.75` — matching what other engines
+ship. They are not configurable, on purpose: a search that ranked differently here than on
+the engine a client was written against would be a compatibility bug rather than an
+improvement.
+
+Inverse document frequency is the Lucene form, `ln(1 + (N - df + 0.5) / (df + 0.5))`,
+which never goes negative — so a term appearing in most documents contributes very little
+but can never *subtract* from a score and push a document that matched two terms below one
+that matched a single rare one. Worked example, on an index of three documents:
+
+| Term | `df` | `idf` | score of a one-term document |
+|---|---|---|---|
+| in every document | 3 | 0.134 | 0.168 |
+| in one document | 1 | 0.981 | 1.233 |
+| never seen | 0 | 2.079 | 2.614 |
+
+Two consequences for using it:
+
+- **Scores are comparable within one result set, and not between them.** They depend on
+  the index's document count and average length, so a score of 2.6 in one query says
+  nothing about a 2.6 in another, and a fixed score threshold is not a meaningful filter.
+- **The filter half of a query contributes nothing to the score.** `(@group_id:"g")` narrows
+  the candidates; only the term half ranks them.
+
 Both arms score with one reconciled `idf`, taken from the built index's statistics,
 so a term's weight cannot change depending on which arm found a document. Those
 statistics go slightly stale between consolidations: a superseded document still
