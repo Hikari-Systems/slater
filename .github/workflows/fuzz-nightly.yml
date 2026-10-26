@@ -16,8 +16,8 @@ name: fuzz-nightly
 #   * Scheduled workflows always run on the default branch (main), and caches
 #     created on the default branch are restorable from the tag pushes that drive
 #     release.yml — so accumulating here is exactly what the release gate needs.
-#   * runs-on: ubuntu-latest — this repo is public, so GitHub-hosted minutes are
-#     free.
+#   * runs-on: self-hosted-public-amd64 — the org's self-hosted runners; see the
+#     runner note in ci.yml for the per-runner Rust home and the missing sudo.
 on:
   schedule:
     # 04:37 UTC — off the top of the hour to dodge scheduler congestion/delay.
@@ -39,7 +39,7 @@ jobs:
   # The targets fan out one-per-runner across the matrix (as the release gate
   # does), so they fuzz in parallel and each persists its own corpus.
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     # 40 was ~1 minute of headroom and `parse_statement` finally crossed it on
     # 2026-08-07 (run 31152379917, cancelled mid cache-save at 40m22s; the night
     # before finished at 38m41s). That leg currently spends its whole
@@ -57,9 +57,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build.
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the runner note in ci.yml.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       # PINNED, not floating — kept in lockstep with release.yml's fuzz gate, which
       # carries the full rationale. Short version: the nightly published 2026-07-24

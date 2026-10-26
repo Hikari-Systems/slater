@@ -28,14 +28,33 @@ concurrency:
 permissions:
   contents: read
 
+# Runs on the org's self-hosted public runners: amd64 jobs on
+# `self-hosted-public-amd64` (two runners on one persistent host, as one user)
+# and, in release.yml, the arm64 image build on `self-hosted-public-arm64`. So:
+#   * one Rust home per runner (RUSTUP_HOME/CARGO_HOME named for $RUNNER_NAME):
+#     two jobs installing into one ~/.rustup at once break each other ("could not
+#     rename component file ... Directory not empty");
+#   * no `sudo apt-get`: the runner user has no sudo. The cmake/clang/libclang the
+#     GitHub-hosted jobs used to install are not needed outside Docker — on
+#     x86_64 Linux aws-lc-sys (rustls) and zstd-sys build with the host's C compiler
+#     alone; cmake and libclang are only for aws-lc-sys's CMake builder and bindgen,
+#     which this target does not use. Every cargo job runs on amd64; the arm64
+#     runner only runs the Docker build, and the Dockerfiles install their own.
+
 jobs:
   # ── Formatting: mirror the local pre-commit hook (.githooks/pre-commit) ─────
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # One Rust home per runner; see the note at the top of this file.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -58,14 +77,17 @@ jobs:
 
   # ── Clippy: mirror the local pre-commit hook (.githooks/pre-commit) ────────
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the note at the top of this file.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -93,16 +115,17 @@ jobs:
 
   # ── Build: the whole workspace must compile against the committed lockfile ──
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
-      # the Dockerfile builder stage and release.yml).
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the note at the top of this file.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -121,16 +144,17 @@ jobs:
   # compiled and linted clean but broke a unit test could merge green and surface
   # only at release; running it on every commit closes that gap.
   test:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see the
-      # build job and the Dockerfile builder stage).
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the note at the top of this file.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -175,14 +199,17 @@ jobs:
   #    `--features`, so it is never compiled. It was previously believed to be the
   #    reason a blanket `--ignored` was impossible here. It was not.
   consolidation:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the note at the top of this file.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -231,7 +258,7 @@ jobs:
   #    Each backend is exercised alone and together, so a feature that only
   #    compiles alongside the other is still caught.
   store-backends:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -241,10 +268,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # rustls' aws-lc-rs backend (pulled by the s3 SDK) needs a C toolchain +
-      # libclang, same as the build job and the Dockerfile builder stage.
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the note at the top of this file.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable

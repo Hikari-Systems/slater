@@ -2,9 +2,9 @@ name: release
 
 # On a vX.Y.Z tag this workflow does both release jobs in one place:
 #   1. Docker image — build natively per arch (a Rust build under QEMU emulation
-#      would be far too slow), push each arch to Docker Hub *by digest* so no
-#      per-arch tags are created, then merge the digests into a single manifest
-#      tagged with the git tag (e.g. hikarisystems/slater:v0.1.3) and `latest`.
+#      would be far too slow) into the org's S3-backed staging registry, merge the
+#      arches into one manifest there, then copy it to Docker Hub tagged with the
+#      git tag (e.g. hikarisystems/slater:v0.1.3) and `latest`.
 #   2. Release binaries — build the compiled `slater` + `slater-build` binaries
 #      and attach them (plus checksums) to the GitHub release for the tag.
 #      GitHub already attaches the "Source code (zip/tar.gz)" archives itself.
@@ -48,7 +48,7 @@ jobs:
   # publishes off a branch push.
   test:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
     steps:
       - name: Checkout the tag
@@ -77,10 +77,11 @@ jobs:
             exit 1
           fi
 
-      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
-      # the Dockerfile builder stage).
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the runner note in ci.yml.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -109,10 +110,9 @@ jobs:
   # so the new write-grammar parser surface is fuzzed per commit. The targets fan
   # out one-per-runner across the matrix so they run in parallel and a crash fails
   # only its own leg while still blocking the release. cargo-fuzz needs nightly +
-  # libFuzzer. Runs on free GitHub-hosted runners (this repo is public, so the
-  # minutes are free), as does every other job here.
+  # libFuzzer. amd64 only: the targets are pinned to x86_64-unknown-linux-gnu.
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -124,9 +124,11 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build.
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the runner note in ci.yml.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       # PINNED, not floating. The nightly published 2026-07-24 (rustc 89c61a754)
       # introduced a codegen ICE that aborts any *release* build of tokio —
@@ -210,13 +212,30 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # ── Docker: native per-arch build, pushed to Docker Hub by digest ──────────
+  # ── Docker: native per-arch build, staged in the S3 registry ────────────────
+  # Built the way simmer and the woodhouse repos build on the self-hosted runners:
+  # a buildx builder on the job's Docker network, so it reaches the plain-HTTP
+  # `registry` service by name and needs no host port. The arm64 runner is a
+  # container under Docker Desktop on a Mac, where a Docker-assigned host port is
+  # not reachable from the builder, and a fixed one would collide between the two
+  # amd64 runners sharing a host.
+  #
+  # Nothing logs in to Docker Hub here: `docker login` writes the runner user's
+  # ~/.docker/config.json, which every job on that host shares, so one job's
+  # logout could pull the credentials from under another's push. Only
+  # `docker-manifest` talks to Docker Hub, through skopeo with its auth file under
+  # $RUNNER_TEMP.
+  #
+  # The layer cache lives in the same registry, one cache tag per variant and
+  # platform since each one's layers differ, so the Dockerfiles' dependency-stub
+  # layers are found again on the next release. No provenance or SBOM: they would
+  # turn the per-platform tag into an index, which `docker manifest create`
+  # refuses.
   docker-build:
     needs: [test, fuzz]
     runs-on: ${{ matrix.runner }}
     # Slater is a heavy Rust build (rustls/aws-lc-rs, tokio, zstd, argon2); give
-    # each native arch plenty of wall-clock. Both arches build natively on free
-    # GitHub-hosted runners (public repo: ubuntu-24.04 and ubuntu-24.04-arm).
+    # each native arch plenty of wall-clock.
     timeout-minutes: 90
     strategy:
       matrix:
@@ -233,18 +252,30 @@ jobs:
           # no flag is needed there. (These match on `platform`, so they apply to
           # both variants of that arch.)
           - platform: amd64
-            runner: ubuntu-24.04
+            runner: self-hosted-public-amd64
             rustflags: "-Ctarget-cpu=x86-64-v3"
           - platform: arm64
-            runner: ubuntu-24.04-arm
+            runner: self-hosted-public-arm64
             rustflags: ""
           # Per-variant Dockerfile (match on `variant`, so they apply to both
-          # arches of that variant). Both push by digest to the same repo; the
-          # manifest job below tags them apart.
+          # arches of that variant).
           - variant: full
             dockerfile: Dockerfile
           - variant: lite
             dockerfile: Dockerfile.lite
+    services:
+      registry:
+        image: registry:3.0
+        env:
+          REGISTRY_STORAGE: s3
+          REGISTRY_STORAGE_S3_ACCESSKEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          REGISTRY_STORAGE_S3_SECRETKEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          REGISTRY_STORAGE_S3_REGION: ${{ secrets.AWS_REGION }}
+          REGISTRY_STORAGE_S3_BUCKET: hikari-docker-registry
+          REGISTRY_HTTP_ADDR: :5000
+          REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -254,49 +285,35 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Set up Docker Buildx
+      - name: Set up buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          driver-opts: network=${{ job.container.network }}
+          buildkitd-config-inline: |
+            [registry."registry:5000"]
+              http = true
+              insecure = true
 
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/${{ matrix.platform }}
-          build-args: |
-            RUSTFLAGS=${{ matrix.rustflags }}
-          outputs: type=image,name=hikarisystems/${{ env.REPO_NAME }},push-by-digest=true,push=true
-
-      - name: Export digest
+      # Staged under the release tag rather than github.sha: on a manual dispatch
+      # github.sha is the default branch's head, not the tag being built.
+      - name: Build and push to the S3 registry
         run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          CACHE=registry:5000/${{ env.REPO_NAME }}:buildcache-${{ matrix.variant }}-${{ matrix.platform }}
+          docker buildx build --target runtime --platform linux/${{ matrix.platform }} \
+            -f ${{ matrix.dockerfile }} \
+            --build-arg 'RUSTFLAGS=${{ matrix.rustflags }}' \
+            --cache-from type=registry,ref=$CACHE \
+            --cache-to type=registry,ref=$CACHE,mode=max,image-manifest=true,oci-mediatypes=true \
+            --provenance=false --sbom=false --push \
+            -t registry:5000/${{ env.REPO_NAME }}:${TAG}-${{ matrix.variant }}-${{ matrix.platform }} .
 
-      - name: Upload digest
-        uses: actions/upload-artifact@v7
-        with:
-          name: digests-${{ matrix.variant }}-${{ matrix.platform }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  # ── Docker: merge each variant's per-arch digests into a tagged manifest ─────
+  # ── Docker: merge each variant's arches and copy it to Docker Hub ───────────
   # Both variants are tags of the SAME `hikarisystems/slater` repo:
   #   * full → :<tag>      + :latest
   #   * lite → :<tag>-lite + :latest-lite
-  # Each job merges only its own variant's per-arch digests (matched by the
-  # `digests-<variant>-*` artifact pattern); the digests live in the one repo.
   docker-manifest:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: self-hosted-public-amd64
+    timeout-minutes: 15
     needs: docker-build
     strategy:
       matrix:
@@ -309,38 +326,70 @@ jobs:
           - variant: lite
             tag_suffix: "-lite"
             moving: latest-lite
+    services:
+      registry:
+        image: registry:3.0
+        env:
+          REGISTRY_STORAGE: s3
+          REGISTRY_STORAGE_S3_ACCESSKEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          REGISTRY_STORAGE_S3_SECRETKEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          REGISTRY_STORAGE_S3_REGION: ${{ secrets.AWS_REGION }}
+          REGISTRY_STORAGE_S3_BUCKET: hikari-docker-registry
+          REGISTRY_HTTP_ADDR: :5000
+          REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
+          REGISTRY_STORAGE_DELETE_ENABLED: "true"
+        ports:
+          # A random host port: a fixed one collides between the two runners
+          # sharing the amd64 host.
+          - 5000
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
 
-      - name: Download digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-${{ matrix.variant }}-*
-          merge-multiple: true
+      - name: Point REGISTRY at the service
+        run: echo "REGISTRY=localhost:${{ job.services.registry.ports['5000'] }}" >> "$GITHUB_ENV"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create the manifest (pinned + rolling tag)
-        working-directory: ${{ runner.temp }}/digests
+      # Already on the self-hosted host, whose runner user has no sudo.
+      - name: Install skopeo
         run: |
-          docker buildx imagetools create \
-            -t hikarisystems/${{ env.REPO_NAME }}:${{ github.event.inputs.tag || github.ref_name }}${{ matrix.tag_suffix }} \
-            -t hikarisystems/${{ env.REPO_NAME }}:${{ matrix.moving }} \
-            $(printf 'hikarisystems/${{ env.REPO_NAME }}@sha256:%s ' *)
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y skopeo
+          fi
+
+      # Into $RUNNER_TEMP, which the runner deletes after the job: skopeo's
+      # default auth file is in the runner user's home, and on the persistent
+      # self-hosted host that would hand this login to every later job.
+      - name: Log in to Docker Hub via skopeo
+        run: |
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/containers-auth.json" >> "$GITHUB_ENV"
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/containers-auth.json"
+          skopeo login index.docker.io \
+            --username ${{ secrets.DOCKERHUB_USERNAME }} \
+            --password ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # `--purge` so no local manifest list outlives the job on the shared host.
+      - name: Create the multi-arch manifest in the S3 registry
+        run: |
+          src="${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${TAG}-${{ matrix.variant }}"
+          docker manifest create --insecure "$src" "$src-amd64" "$src-arm64"
+          docker manifest push --purge --insecure "$src"
+
+      - name: Copy to Docker Hub (pinned + rolling tag)
+        run: |
+          set -euo pipefail
+          src="docker://${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${TAG}-${{ matrix.variant }}"
+          for T in "${TAG}${{ matrix.tag_suffix }}" "${{ matrix.moving }}"; do
+            skopeo copy --all --src-tls-verify=false "$src" \
+              "docker://hikarisystems/${{ env.REPO_NAME }}:${T}"
+          done
 
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:
     needs: [test, fuzz]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     env:
       # The tag this run targets: the pushed ref, or the manual dispatch input.
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -371,10 +420,11 @@ jobs:
             echo "__RELEASE_NOTES__"
           } >> "$GITHUB_OUTPUT"
 
-      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
-      # the Dockerfile builder stage); git is already present on the runner.
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      # One Rust home per runner; see the runner note in ci.yml.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
