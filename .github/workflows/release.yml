@@ -110,8 +110,7 @@ jobs:
   # out one-per-runner across the matrix so they run in parallel and a crash fails
   # only its own leg while still blocking the release. cargo-fuzz needs nightly +
   # libFuzzer. Runs on free GitHub-hosted runners (this repo is public, so the
-  # minutes are free) rather than the billed Blacksmith runners — the Docker build
-  # below keeps Blacksmith for its native per-arch (incl. arm64) compiles.
+  # minutes are free), as does every other job here.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -216,7 +215,8 @@ jobs:
     needs: [test, fuzz]
     runs-on: ${{ matrix.runner }}
     # Slater is a heavy Rust build (rustls/aws-lc-rs, tokio, zstd, argon2); give
-    # each native arch plenty of wall-clock on the 2-vCPU runners.
+    # each native arch plenty of wall-clock. Both arches build natively on free
+    # GitHub-hosted runners (public repo: ubuntu-24.04 and ubuntu-24.04-arm).
     timeout-minutes: 90
     strategy:
       matrix:
@@ -233,10 +233,10 @@ jobs:
           # no flag is needed there. (These match on `platform`, so they apply to
           # both variants of that arch.)
           - platform: amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: ubuntu-24.04
             rustflags: "-Ctarget-cpu=x86-64-v3"
           - platform: arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             rustflags: ""
           # Per-variant Dockerfile (match on `variant`, so they apply to both
           # arches of that variant). Both push by digest to the same repo; the

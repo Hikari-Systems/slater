@@ -17,7 +17,7 @@ name: fuzz-nightly
 #     created on the default branch are restorable from the tag pushes that drive
 #     release.yml — so accumulating here is exactly what the release gate needs.
 #   * runs-on: ubuntu-latest — this repo is public, so GitHub-hosted minutes are
-#     free; no reason to spend the billed Blacksmith runners on a nightly long-run.
+#     free.
 on:
   schedule:
     # 04:37 UTC — off the top of the hour to dodge scheduler congestion/delay.
