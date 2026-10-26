@@ -53,7 +53,7 @@ crc32c = "0.6"
 # put/head; it is async, so `store::s3` bridges it with an owned current-thread
 # runtime — contained entirely in that module, the storage trait stays sync.
 aws-config = { version = "1", optional = true }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
 # GCS backend (optional). `gcloud-storage` talks to GCS over the **JSON API**
 # (not gRPC), which surfaces the object `crc32c` checksum on get/list, validates an

@@ -46,7 +46,7 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 
 # Storage codec (graph-format).
-zstd = "0.13"
+zstd = "0.14"
 # `rayon` gives `Hasher::update_rayon`, which hashes one buffer across the pool.
 # BLAKE3 is a Merkle tree, so a single large file parallelises internally — which is
 # what the publish phase needs: `topology.csr.blk` alone is 71% of a generation's
