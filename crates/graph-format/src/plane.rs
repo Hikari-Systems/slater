@@ -539,8 +539,8 @@ impl EfMono {
         let lows = body[9..9 + low_bytes].to_vec().into_boxed_slice();
         let mut highs = Vec::with_capacity(nwords);
         let hstart = 9 + low_bytes;
-        for w in body[hstart..hstart + high_bytes].chunks_exact(8) {
-            highs.push(u64::from_le_bytes(w.try_into().unwrap()));
+        for w in body[hstart..hstart + high_bytes].as_chunks::<8>().0 {
+            highs.push(u64::from_le_bytes(*w));
         }
         // The byte-length check above validates the *shape* of the body but says nothing about
         // its content: an EF high bitmap must hold exactly `m` one-bits (one per value), and
@@ -925,8 +925,10 @@ pub fn decode_plane(bytes: &[u8]) -> Result<PlaneChunk> {
                 bail!("raw-u64 plane body {} not a multiple of 8", body.len());
             }
             let vals: Vec<u64> = body
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
                 .collect();
             Ok(resident_from_values(&vals))
         }
@@ -946,8 +948,10 @@ pub fn decode_plane(bytes: &[u8]) -> Result<PlaneChunk> {
                 );
             }
             let vals: Vec<u64> = dense
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
                 .collect();
             Ok(resident_from_values(&vals))
         }

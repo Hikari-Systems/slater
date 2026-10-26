@@ -137,15 +137,15 @@ pub fn distance(metric: Metric, query: &[f32], candidate: &[f32]) -> f64 {
 #[inline]
 fn dot_simd(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = f32x8::ZERO;
-    let mut ar = a.chunks_exact(8);
-    let mut br = b.chunks_exact(8);
-    for (ac, bc) in ar.by_ref().zip(br.by_ref()) {
-        let av = f32x8::from(<[f32; 8]>::try_from(ac).unwrap());
-        let bv = f32x8::from(<[f32; 8]>::try_from(bc).unwrap());
+    let (ar, ar_tail) = a.as_chunks::<8>();
+    let (br, br_tail) = b.as_chunks::<8>();
+    for (ac, bc) in ar.iter().zip(br) {
+        let av = f32x8::from(*ac);
+        let bv = f32x8::from(*bc);
         acc = av.mul_add(bv, acc);
     }
     let mut sum = acc.reduce_add();
-    for (x, y) in ar.remainder().iter().zip(br.remainder()) {
+    for (x, y) in ar_tail.iter().zip(br_tail) {
         sum += x * y;
     }
     sum
@@ -157,16 +157,16 @@ fn dot_simd(a: &[f32], b: &[f32]) -> f32 {
 fn dot_and_norm2(q: &[f32], v: &[f32]) -> (f32, f32) {
     let mut accd = f32x8::ZERO;
     let mut accn = f32x8::ZERO;
-    let mut qr = q.chunks_exact(8);
-    let mut vr = v.chunks_exact(8);
-    for (qc, vc) in qr.by_ref().zip(vr.by_ref()) {
-        let qv = f32x8::from(<[f32; 8]>::try_from(qc).unwrap());
-        let vv = f32x8::from(<[f32; 8]>::try_from(vc).unwrap());
+    let (qr, qr_tail) = q.as_chunks::<8>();
+    let (vr, vr_tail) = v.as_chunks::<8>();
+    for (qc, vc) in qr.iter().zip(vr) {
+        let qv = f32x8::from(*qc);
+        let vv = f32x8::from(*vc);
         accd = qv.mul_add(vv, accd);
         accn = vv.mul_add(vv, accn);
     }
     let (mut d, mut n) = (accd.reduce_add(), accn.reduce_add());
-    for (x, y) in qr.remainder().iter().zip(vr.remainder()) {
+    for (x, y) in qr_tail.iter().zip(vr_tail) {
         d += x * y;
         n += y * y;
     }
@@ -178,16 +178,16 @@ fn dot_and_norm2(q: &[f32], v: &[f32]) -> (f32, f32) {
 #[inline]
 fn l2_sq_simd(q: &[f32], v: &[f32]) -> f32 {
     let mut acc = f32x8::ZERO;
-    let mut qr = q.chunks_exact(8);
-    let mut vr = v.chunks_exact(8);
-    for (qc, vc) in qr.by_ref().zip(vr.by_ref()) {
-        let qv = f32x8::from(<[f32; 8]>::try_from(qc).unwrap());
-        let vv = f32x8::from(<[f32; 8]>::try_from(vc).unwrap());
+    let (qr, qr_tail) = q.as_chunks::<8>();
+    let (vr, vr_tail) = v.as_chunks::<8>();
+    for (qc, vc) in qr.iter().zip(vr) {
+        let qv = f32x8::from(*qc);
+        let vv = f32x8::from(*vc);
         let d = qv - vv;
         acc = d.mul_add(d, acc);
     }
     let mut sum = acc.reduce_add();
-    for (x, y) in qr.remainder().iter().zip(vr.remainder()) {
+    for (x, y) in qr_tail.iter().zip(vr_tail) {
         let d = x - y;
         sum += d * d;
     }

@@ -324,7 +324,7 @@ impl DiskCache {
         let len = bytes.len() as u64;
         if self
             .queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |q| {
                 (q == 0 || q + len <= self.queue_budget_bytes).then_some(q + len)
             })
             .is_err()

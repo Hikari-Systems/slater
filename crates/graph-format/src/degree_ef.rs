@@ -308,8 +308,8 @@ impl EfChunk {
         let lows = body[9..9 + low_bytes].to_vec().into_boxed_slice();
         let mut highs = Vec::with_capacity(nwords);
         let hstart = 9 + low_bytes;
-        for w in body[hstart..hstart + high_bytes].chunks_exact(8) {
-            highs.push(u64::from_le_bytes(w.try_into().unwrap()));
+        for w in body[hstart..hstart + high_bytes].as_chunks::<8>().0 {
+            highs.push(u64::from_le_bytes(*w));
         }
         // The byte-length check validates the body's shape, not its content: the high bitmap
         // must hold exactly `m` one-bits, and with fewer, `select1` walks off the end of
@@ -651,8 +651,10 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<DegreeChunk> {
                 bail!("raw degree-chunk body {} not a multiple of 4", body.len());
             }
             let degs: Vec<u32> = body
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             Ok(resident_from_degrees(&degs))
         }
@@ -674,8 +676,10 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<DegreeChunk> {
                 );
             }
             let degs: Vec<u32> = dense
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             Ok(resident_from_degrees(&degs))
         }

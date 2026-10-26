@@ -132,7 +132,7 @@ pub struct DegreeColumn {
 /// Saturating at zero errs the other way (the budget sees room to spare), and the
 /// `debug_assert!` makes a violation fail the test suite where that is free.
 fn debit_resident(counter: &AtomicUsize, bytes: usize) {
-    let prev = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+    let prev = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
         Some(c.saturating_sub(bytes))
     });
     debug_assert!(

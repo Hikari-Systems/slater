@@ -279,8 +279,8 @@ impl SortRecord for PendingVector {
             );
         }
         let mut vec = Vec::with_capacity(r.len() / 4);
-        for chunk in r.chunks_exact(4) {
-            vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for chunk in r.as_chunks::<4>().0 {
+            vec.push(f32::from_le_bytes(*chunk));
         }
         *r = &r[r.len()..];
         Ok(PendingVector { seq, id, vec })

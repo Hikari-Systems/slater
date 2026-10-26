@@ -359,8 +359,10 @@ pub fn read_vector_carry_at(
         );
     }
     Ok(bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 
@@ -778,8 +780,10 @@ impl DumpReader {
                 );
             }
             let vector: Vec<f32> = r[..dim * 4]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             f(node_id, key_id, vector)
         })

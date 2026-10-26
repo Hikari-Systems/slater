@@ -139,16 +139,14 @@ struct Points {
 #[inline]
 fn l2_sq_simd(a: &[f32], b: &[f32]) -> f64 {
     let mut acc = f32x8::ZERO;
-    let mut ar = a.chunks_exact(8);
-    let mut br = b.chunks_exact(8);
-    for (ac, bc) in ar.by_ref().zip(br.by_ref()) {
-        let av = f32x8::from(<[f32; 8]>::try_from(ac).unwrap());
-        let bv = f32x8::from(<[f32; 8]>::try_from(bc).unwrap());
-        let d = av - bv;
+    let (ac, at) = a.as_chunks::<8>();
+    let (bc, bt) = b.as_chunks::<8>();
+    for (ac, bc) in ac.iter().zip(bc) {
+        let d = f32x8::from(*ac) - f32x8::from(*bc);
         acc = d.mul_add(d, acc);
     }
     let mut sum = acc.reduce_add();
-    for (x, y) in ar.remainder().iter().zip(br.remainder()) {
+    for (x, y) in at.iter().zip(bt) {
         let d = x - y;
         sum += d * d;
     }
@@ -169,15 +167,13 @@ impl Points {
     fn ip(&self, a: VamanaIndex, b: VamanaIndex) -> f64 {
         let (x, y) = (self.row(a), self.row(b));
         let mut acc = f32x8::ZERO;
-        let mut xr = x.chunks_exact(8);
-        let mut yr = y.chunks_exact(8);
-        for (xc, yc) in xr.by_ref().zip(yr.by_ref()) {
-            let xv = f32x8::from(<[f32; 8]>::try_from(xc).unwrap());
-            let yv = f32x8::from(<[f32; 8]>::try_from(yc).unwrap());
-            acc = xv.mul_add(yv, acc);
+        let (xc, xt) = x.as_chunks::<8>();
+        let (yc, yt) = y.as_chunks::<8>();
+        for (xc, yc) in xc.iter().zip(yc) {
+            acc = f32x8::from(*xc).mul_add(f32x8::from(*yc), acc);
         }
         let mut sum = acc.reduce_add();
-        for (p, q) in xr.remainder().iter().zip(yr.remainder()) {
+        for (p, q) in xt.iter().zip(yt) {
             sum += p * q;
         }
         sum as f64

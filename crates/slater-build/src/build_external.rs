@@ -772,8 +772,10 @@ fn load_perm(path: &Path, node_count: u64) -> Result<Permutation> {
         );
     }
     let table = bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     Ok(Permutation::Table(table))
 }

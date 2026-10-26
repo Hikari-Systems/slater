@@ -3287,7 +3287,7 @@ fn lower_var_length(pair: Pair<Rule>) -> Result<VarLength> {
         } else {
             Some(parse_u32(iter.next().unwrap())?)
         };
-        let max = iter.next().map(&parse_u32).transpose()?;
+        let max = iter.next().map(parse_u32).transpose()?;
         Ok(VarLength { min, max })
     }
 }
