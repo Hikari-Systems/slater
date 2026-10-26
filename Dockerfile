@@ -20,6 +20,11 @@ WORKDIR /app
 # arg. Note: `x86-64-v3` raises the amd64 CPU floor to Haswell (2013+).
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=$RUSTFLAGS
+# Every `cargo build` below passes an explicit `--target` (the host triple), so
+# RUSTFLAGS reach only the shipped code and not build scripts or proc macros,
+# which run on the build machine itself. Without it a `x86-64-v3` build dies
+# with SIGILL on a pre-Haswell builder (the self-hosted runner is Ivy Bridge).
+# Outputs land in target/<triple>/release, hence the `target/*/release` globs.
 
 # Cargo features to compile into the binaries. Defaults to the S3 and GCS
 # object-store data backends so the image can serve from (and publish to)
@@ -96,13 +101,13 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
     && echo '' > crates/slater/tests/wd91m_write_smoke.rs \
     && echo '' > crates/slater/tests/object_store_readamp.rs \
-    && cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
+    && cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
     && rm -rf crates/*/src \
-       target/release/slater target/release/slater-build target/release/bench-codec \
-       target/release/deps/slater-* target/release/deps/slater_build-* \
-       target/release/deps/slater_scalar-* target/release/deps/libslater_scalar-* \
-       target/release/deps/bench_codec-* \
-       target/release/deps/graph_format-* target/release/deps/libgraph_format-*
+       target/*/release/slater target/*/release/slater-build target/*/release/bench-codec \
+       target/*/release/deps/slater-* target/*/release/deps/slater_build-* \
+       target/*/release/deps/slater_scalar-* target/*/release/deps/libslater_scalar-* \
+       target/*/release/deps/bench_codec-* \
+       target/*/release/deps/graph_format-* target/*/release/deps/libgraph_format-*
 
 # ── Real build ────────────────────────────────────────────────────────────────
 # Only the two shipped binaries. `bench-codec` is an occasional tuning tool gated
@@ -110,7 +115,7 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
 # here; build it on demand with
 # `cargo build -p slater-build --features bench-codec --bin bench-codec`.
 COPY crates ./crates
-RUN cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
+RUN cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
         --bin slater --bin slater-build
 
 # Empty directories for the runtime stage to copy in as the writable mount points
@@ -127,8 +132,8 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/slater ./slater
-COPY --from=builder /app/target/release/slater-build ./slater-build
+COPY --from=builder /app/target/*/release/slater ./slater
+COPY --from=builder /app/target/*/release/slater-build ./slater-build
 # Baked-in defaults; per-environment overrides arrive via the /sandbox overlay
 # and `KEY__sub` env vars (hs-utils layered config), see docker-compose.yml.
 COPY config.json ./config.json

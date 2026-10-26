@@ -24,6 +24,11 @@ WORKDIR /app
 # the real build. Default empty → a portable baseline build.
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=$RUSTFLAGS
+# Every `cargo build` below passes an explicit `--target` (the host triple), so
+# RUSTFLAGS reach only the shipped code and not build scripts or proc macros,
+# which run on the build machine itself. Without it a `x86-64-v3` build dies
+# with SIGILL on a pre-Haswell builder (the self-hosted runner is Ivy Bridge).
+# Outputs land in target/<triple>/release, hence the `target/*/release` globs.
 
 # Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
 # C/C++ toolchain (clang) + libclang for its bindgen step. `git` is already in
@@ -96,17 +101,17 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
     && echo '' > crates/slater/tests/wd91m_write_smoke.rs \
     && echo '' > crates/slater/tests/object_store_readamp.rs \
-    && cargo build --release --locked -p slater \
+    && cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" -p slater \
     && rm -rf crates/*/src \
-       target/release/slater \
-       target/release/deps/slater-* \
-       target/release/deps/slater_scalar-* target/release/deps/libslater_scalar-* \
-       target/release/deps/graph_format-* target/release/deps/libgraph_format-*
+       target/*/release/slater \
+       target/*/release/deps/slater-* \
+       target/*/release/deps/slater_scalar-* target/*/release/deps/libslater_scalar-* \
+       target/*/release/deps/graph_format-* target/*/release/deps/libgraph_format-*
 
 # ── Real build ────────────────────────────────────────────────────────────────
 # Only the server binary, filesystem backend only (no `--features`).
 COPY crates ./crates
-RUN cargo build --release --locked -p slater --bin slater
+RUN cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" -p slater --bin slater
 
 # Minimal glibc (non-musl) runtime: Debian 12 distroless ships glibc +
 # libgcc/libstdc++ + ca-certificates and nothing else (no shell/apt/coreutils), so
@@ -116,7 +121,7 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/slater ./slater
+COPY --from=builder /app/target/*/release/slater ./slater
 # Baked-in defaults; per-environment overrides arrive via the /sandbox overlay
 # and `KEY__sub` env vars (hs-utils layered config), see docker-compose.yml.
 COPY config.json ./config.json
