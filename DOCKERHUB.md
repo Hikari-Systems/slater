@@ -45,16 +45,16 @@ in the repository at
 | **Bounded, predictable memory** | Resident memory is capped by three cache budgets *you* set — it does **not** grow with graph size. You tune the performance/RAM trade-off instead of provisioning for the whole graph. |
 | **Multi-tenant out of the box** | One server hosts many graphs with per-user read grants — multi-database isolation that most graph DBs reserve for a paid/enterprise tier. |
 | **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
-| **Tiny install** | A small stripped binary on a distroless glibc base (no shell/apt) — the multi-arch (amd64/arm64) image pulls at ~22 MB, or ~12 MB for the server-only `slater:latest-lite` tag; pure-Rust TLS, no OpenSSL. Pull and run. |
+| **Tiny install** | Distroless, no shell — ~22 MB multi-arch image, ~12 MB for `:latest-lite`; pure-Rust TLS, no OpenSSL. |
 | **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
-| **Rugged under load** | The server and offline builder both compile with `#![forbid(unsafe_code)]` — the engine's only `unsafe` lives in the audited jemalloc allocator crate. The immutable core means reads take no locks and never wait; a single writer serialises mutations behind the write path alone — no GC pauses, no data races. One bad query can't take the server down. |
+| **Rugged under load** | Server and builder are `#![forbid(unsafe_code)]`; reads take no locks and never wait, a single writer serialises mutations — no GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
 | **Rich Cypher query surface** | A broad read surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
-| **Live, durable writes** | An opt-in single-writer LSM layer over the immutable core (`delta.enabled`): business-key `MERGE` / `SET` / `DELETE` over nodes and relationships, batched write-`UNWIND` (one `fsync` per batch), and `CALL slater.consolidate()` — group-committed, `fsync`-durable, folded back into a fresh core. Reads are byte-identical when the delta is empty. See [Writing to a graph](#writing-to-a-graph). |
-| **ISO GQL, read and write** | Speaks a subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, an optional `GQL`/`CYPHER` dialect prefix — and, with the writable layer on, GQL's data-modifying statements (`INSERT` / `SET` / `REMOVE` / `DELETE`) lower onto the same durable write path. Cypher and GQL, in one engine. See [Querying with GQL](#querying-with-gql). |
-| **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ; cosine / L2 / dot) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. Embeddings are **writable** in place (a FreshDiskANN-style write ladder): insert / update / delete a vector and it is KNN-visible at once, folded into the base without an offline rebuild. |
+| **Live, durable writes** | Opt-in (`delta.enabled`): business-key `MERGE` / `SET` / `DELETE`, group-committed and `fsync`-durable, folded back into a fresh core. See [Writing to a graph](#writing-to-a-graph). |
+| **ISO GQL, read and write** | A subset of **ISO GQL** (ISO/IEC 39075) on the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label booleans, `INSERT`. See [Querying with GQL](#querying-with-gql). |
+| **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ; cosine / L2 / dot) plus graph algorithms (PageRank, BFS, betweenness, WCC…). Embeddings are writable in place and KNN-visible at once. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
-| **Pluggable storage backends** | Serve the same generation format from a local volume, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-disk cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
+| **Pluggable storage backends** | Serve from a local volume, S3 (or S3-compatible) **or** GCS, with an optional local-disk cache tier. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 
 ---
 
@@ -68,8 +68,7 @@ repo** (multi-arch amd64 + arm64):
 | **`:latest`** / **`:vX.Y.Z`** (full) | both binaries (`slater` + `slater-build`) | filesystem **+ S3 + GCS** | the default — you want to build generations in-container and/or serve from (and publish to) S3 or GCS object storage. |
 | **`:latest-lite`** / **`:vX.Y.Z-lite`** | the server only (`slater`) | filesystem **only** | a smaller image / smaller dependency surface for the common serve-only case: serve a generation built elsewhere from a local or mounted volume. No object-store backends, no `slater-build`. |
 
-Everything below uses the full tag but applies equally to the `-lite` tag for the
-server bits (the `slater-build` and S3/GCS sections are full-only).
+Everything below uses the full tag; the server bits apply equally to `-lite`.
 
 ```bash
 docker pull hikarisystems/slater:latest   # full
@@ -174,26 +173,18 @@ auth, and set the session `database` to the graph you want.
 ### Querying with GQL
 
 Alongside Cypher, Slater understands a subset of **ISO GQL** (ISO/IEC 39075) over the
-**same Bolt connection** — no separate endpoint, no driver change. A statement may
-optionally start with a `GQL`/`CYPHER` dialect selector (like Neo4j's `CYPHER 5`); it is
-stripped and the one engine parses the rest. Every GQL form lowers onto an existing
-capability, so GQL and Cypher spellings are equivalent and mixable — reads always, and
-GQL's data-modifying statements too when the writable layer is on.
+**same Bolt connection**. Every GQL form lowers onto an existing capability, so the two
+spellings are equivalent and mixable:
 
 | GQL | Cypher equivalent |
 |---|---|
-| `MATCH (a) ((x)-[:R]->(y)){1,3} (b)` | `MATCH (a)-[:R*1..3]->(b)` (quantified path) |
-| `MATCH ACYCLIC (a)-[:R*]->(b)` | path restrictor (`WALK`/`TRAIL`/`ACYCLIC`/`SIMPLE`) over `-[:R*]->` |
-| `MATCH ANY SHORTEST (a)-[:R*]->(b)` | `shortestPath((a)-[:R*]->(b))` (also `ALL SHORTEST`, `SHORTEST k`) |
-| `MATCH (n:Person & !Admin)` | label/type booleans `&` `\|` `!`; `:A:B` stays AND sugar |
-| `FOR x IN [1,2,3] RETURN x` | `UNWIND [1,2,3] AS x RETURN x` |
-| `RETURN CAST('42' AS INTEGER)` | `RETURN toInteger('42')` |
-| `INSERT (n:Person {name:'Zoe'})` | `CREATE (n:Person {name:'Zoe'})` (writable layer; GQL's `SET`/`REMOVE`/`DELETE` are spelled as in Cypher) |
-| `GQL MATCH (n) RETURN n` | optional dialect prefix (no-op routing) |
+| `MATCH (a) ((x)-[:R]->(y)){1,3} (b)` | `MATCH (a)-[:R*1..3]->(b)` |
+| `MATCH ANY SHORTEST (a)-[:R*]->(b)` | `shortestPath((a)-[:R*]->(b))` |
+| `MATCH (n:Person & !Admin)` | label booleans `&` `\|` `!` |
+| `INSERT (n:Person {name:'Zoe'})` | `CREATE (n:Person {name:'Zoe'})` (writable layer) |
 
-Responses also carry **GQLSTATUS** objects in the Bolt `SUCCESS`/`FAILURE` metadata
-(`gql_status` + `status_description`), added alongside the existing keys so older
-drivers are unaffected.
+Path restrictors (`ACYCLIC`, `TRAIL`…), `FOR`, `CAST` and the optional `GQL`/`CYPHER`
+prefix are covered in the [querying guide](https://github.com/Hikari-Systems/slater/blob/main/docs/manual/07-querying.md).
 
 ---
 
@@ -243,18 +234,9 @@ MATCH (p:Person {name: 'Dave'}) DETACH DELETE p;
 CALL slater.consolidate();
 ```
 
-How it behaves:
-
-- **A single writer, durable on ack.** Mutations serialise behind one writer per graph; the
-  Bolt `SUCCESS` returns only after the `fsync` that makes the write durable. Group your
-  writes (a write-`UNWIND` commits one `fsync` for the whole batch) and they're cheap.
-- **Reads don't pay for it.** The delta overlay sits below the read surface and is
-  byte-identical to the pure-core read path when empty; whole-graph counters (`count(*)`,
-  label/type marginals) stay metadata reads even with writes pending.
-- **The write grammar is business-key-addressed:** `MERGE` / `MATCH … SET` / `DELETE` (plus
-  `CREATE`, `REMOVE`, detach delete, relationship writes) keyed on a node's identity property.
-- **Consolidation folds the delta into a new core** by rebuilding through `slater-build` and
-  swapping `current` atomically — the same content-hash guard as any published generation.
+A mutation is acknowledged only after the `fsync` that makes it durable, so batch with
+`UNWIND` (one `fsync` per batch). Reads are unaffected when no writes are pending. Full
+grammar and consolidation behaviour: [writing data](https://github.com/Hikari-Systems/slater/blob/main/docs/manual/11-writing-data.md).
 
 Tune it with the `delta.*` knobs in [Configuration](#configuration) below.
 
@@ -281,30 +263,22 @@ So these are equivalent ways to set the block-cache budget:
 
 | Setting | Env var | Default | What it does |
 |---|---|---|---|
-| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3--gcs). |
-| `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root dir of generations (`<graph>/<uuid>/`) for the `fs` backend. |
-| `dataBackend.s3.*` | `dataBackend__s3__*` | _(empty)_ | S3 settings: `bucket`, `region`, `endpoint`, `prefix`, `pathStyle`, `awsAccessKey`/`awsSecretKey`/`awsSessionToken` (else the standard AWS chain), and `diskCacheBytes`/`diskCacheDir` (local-disk second tier). See [Storage backends](#storage-backends-filesystem--s3--gcs). |
-| `dataBackend.gcs.*` | `dataBackend__gcs__*` | _(empty)_ | GCS settings: `bucket`, `prefix`, `endpoint`, `credentialsPath`/`credentialsJson` (else ADC), `anonymous` (emulator only), and `diskCacheBytes`/`diskCacheDir`. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | `fs`, `s3` or `gcs` — see [Storage backends](#storage-backends-filesystem--s3--gcs). |
 | `aclPath` | `aclPath` | `/config/acl.json` | Path to the ACL file. |
-| `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
 | `server.port` | `server__port` | `7687` | Bolt port. |
 | `cache.blockCacheBytes` | `cache__blockCacheBytes` | `67108864` (64 MiB) | Decompressed graph-block LRU. |
 | `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | `67108864` (64 MiB) | Resident PQ codes + Vamana block LRU. A *cap*, not a reservation — empty without vector indexes. |
 | `cache.resultCacheBytes` | `cache__resultCacheBytes` | `16777216` (16 MiB) | Query-result LRU. |
-| `cache.cacheTtlMs` | `cache__cacheTtlMs` | `1800000` (30 min) | **Idle TTL**: a cached entry untouched for this long is reclaimed by a background sweep, freeing memory below the budgets. A **negative** value (or `0`) disables the sweep. |
+| `cache.cacheTtlMs` | `cache__cacheTtlMs` | `1800000` (30 min) | Idle TTL: untouched entries are reclaimed. `0` or negative disables. |
 | `query.maxRows` | `query__maxRows` | `100000` | Max rows per result. |
 | `query.timeoutMs` | `query__timeoutMs` | `30000` | Per-query timeout (`0` = none). |
-| `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | `64` | Vamana beam-search width. |
-| `generationPollMs` | `generationPollMs` | `5000` | How often to poll each graph's `current` pointer. |
-| `reloadStrategy` | `reloadStrategy` | `exit` | On a generation change: `exit` (let the orchestrator restart) or `swap` (hot-swap in place). |
-| `cacheWarmingQuery` | `cacheWarmingQuery` | _(empty)_ | Cypher run once at boot per graph (results discarded) to pre-fault its blocks into the caches so the first matching client query is warm. Empty = off. |
-| `delta.enabled` | `delta__enabled` | `false` | Master switch for the writable layer. Off ⇒ pure immutable core; writes refused. See [Writing to a graph](#writing-to-a-graph). |
-| `delta.walDir` | `delta__walDir` | `wal` | Directory for per-graph WAL segments (the durability floor). Must be a **durable, writable volume — never `tmpfs`**. Relative paths resolve under the data dir. |
-| `delta.memtableBytes` | `delta__memtableBytes` | `67108864` (64 MiB) | In-RAM active memtable budget before it flushes to an immutable L0 delta segment. |
-| `delta.deltaCorePercent` | `delta__deltaCorePercent` | `0` (off) | Auto-consolidate once the delta reaches this % of the core's entity count (rebuild is O(core) — keep rare; typical 5–25). `0` ⇒ manual/scheduled only. |
-| `delta.consolidateWindow` | `delta__consolidateWindow` | _(empty)_ | Off-peak cron window gating auto-consolidation, e.g. `0 1-5 * * *`. Empty ⇒ whenever due. |
-| `delta.deltaHardBytes` | `delta__deltaHardBytes` | `0` (off) | Hard cap on resident delta bytes; a write past it throttles until a consolidation drains — the OOM backstop. |
-| `log.level` | `log__level` | `info` | Log level. |
+| `reloadStrategy` | `reloadStrategy` | `exit` | On a new generation: `exit` or `swap` — see [Updating a live graph](#updating-a-live-graph). |
+| `delta.enabled` | `delta__enabled` | `false` | Turns on the writable layer. |
+| `delta.walDir` | `delta__walDir` | `wal` | WAL directory. A **durable, writable volume — never `tmpfs`**. |
+| `delta.deltaCorePercent` | `delta__deltaCorePercent` | `0` (off) | Auto-consolidate at this % of the core's size (typical 5–25). |
+
+Every other setting (S3/GCS details, query and vector tuning, the remaining `delta.*`
+knobs) is in the [configuration reference](https://github.com/Hikari-Systems/slater/blob/main/docs/manual/14-configuration-reference.md).
 
 Example — a memory-tight server with a 10-minute idle TTL:
 
@@ -340,86 +314,39 @@ time to rebalance the budgets.
 
 ## Storage backends (filesystem / S3 / GCS)
 
-Slater serves the **same** immutable generation byte-format from either local
-storage or an object store — only `dataBackend.kind` changes, never the data.
+Slater serves the **same** generation format from any backend — only `dataBackend.kind`
+changes, never the data.
 
-- **`fs` (default)** — generations live under `/data` (the mounted volume). Right for
-  almost everyone: build, mount read-only, serve. Nothing else to configure.
-- **`s3`** — generations live in an **S3 (or S3-compatible: MinIO/localstack) bucket**;
-  S3 support ships in the image (config-only). Integrity from S3's server-computed
-  SHA-256 via a metadata request (no body download). Credentials from the standard AWS
-  chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or an instance role).
-- **`gcs`** — generations live in a **Google Cloud Storage bucket** (config-only).
-  Integrity from GCS's server-computed CRC32C via a metadata request. Credentials are
-  GCP-native: Application Default Credentials, or a service-account JSON key.
+- **`fs` (default)** — generations under `/data`. Right for almost everyone.
+- **`s3`** — an S3 (or S3-compatible) bucket; credentials from the standard AWS chain.
+- **`gcs`** — a Google Cloud Storage bucket; Application Default Credentials or a
+  service-account key.
 
-**Use S3 or GCS when** you want generations in durable, central object storage that many
-stateless replicas can read — publish once, fan out — or to decouple build from serve
-hosts. The cost is latency (a cold block is a network round-trip); the in-memory caches
-and the **local-disk block cache** below hide most of it. If your data sits on a fast
-local/NFS/EBS volume, `fs` is simpler and faster.
+Object storage lets many stateless replicas read one published copy, at the cost of a
+network round-trip per cold block. If your data sits on a fast local/NFS/EBS volume, `fs`
+is simpler and faster.
 
 ```bash
 docker run -d --name slater-s3 -p 7687:7687 \
   -v "$PWD/acl.json:/config/acl.json:ro" \
+  -v slater-s3-cache:/var/cache/slater \
   -e dataBackend__kind=s3 \
   -e dataBackend__s3__bucket=slater \
   -e dataBackend__s3__region=eu-west-2 \
+  -e dataBackend__s3__diskCacheBytes=10737418240 \
+  -e dataBackend__s3__diskCacheDir=/var/cache/slater \
   -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
   hikarisystems/slater:latest
 ```
 
-### Local-disk block cache (S3/GCS second tier)
+The two `diskCache*` lines are optional: a local-disk second tier that serves evicted
+blocks from SSD instead of a fresh GET. It must be a **real writable volume, never
+`tmpfs`**, sized well above `blockCacheBytes`.
 
-Optional, opt-in: set `dataBackend.s3.diskCacheBytes > 0` and mount a **writable
-volume** for `diskCacheDir`. A block evicted from the in-memory cache is then
-served from local SSD (~0.1 ms) instead of a fresh S3 GET — so an S3-backed node
-performs close to a local one once warm, and your S3 request count/cost drops.
-It caches the bytes exactly as fetched (still compressed and, for encrypted
-generations, still sealed — it never holds the key), writes them behind the query
-on a background thread, evicts to stay within budget, and self-heals a corrupt
-cache file with a checksum verified on every read.
-
-> **Must be a real writable volume, never `tmpfs`.** tmpfs is RAM and would break
-> the bounded-memory guarantee. Size the cache **≫ `blockCacheBytes`**.
-
-Its RAM cost is only the index that tracks the cached blocks plus the
-write-behind queue, which is bounded at `blockCacheBytes / 8` (8 MiB by default)
-and sheds under pressure instead of growing. Both count against the RSS ceiling;
-neither needs configuring — enabling the disk tier does not change how you size
-the container.
-
-Add to the S3 `docker run` above: a writable cache volume and the two flags —
-
-```bash
-  -v slater-s3-cache:/var/cache/slater \
-  -e dataBackend__s3__diskCacheBytes=10737418240 \
-  -e dataBackend__s3__diskCacheDir=/var/cache/slater
-```
-
-### Publishing a generation to S3 or GCS
-
-`slater-build` writes to `--data-dir` first, then optionally uploads to a bucket
-(the remote `current` pointer is written last, so a serving node never sees a
-half-published generation). The image ships with **both** the `s3` and `gcs`
-backends compiled in, so publishing to either needs no special image — just the
-flags.
-
-**S3** (credentials via the `AWS_*` env, an instance role, or
-`--publish-s3-*` flags for an S3-compatible endpoint):
-
-```bash
-docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
-  -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
-  --entrypoint /app/slater-build hikarisystems/slater:latest \
-  --input /dumps/people.cypher --graph people --data-dir /data \
-  --publish-s3-bucket slater --publish-s3-region eu-west-2
-#   MinIO/localstack: add  --publish-s3-endpoint http://host:9000 --publish-s3-path-style
-```
-
-**GCS** — same shape, swapping in `--publish-gcs-bucket <b>` (plus optional
-`--publish-gcs-prefix`). Credentials use Application Default Credentials, or mount a
-service-account key and add `--publish-gcs-credentials /secrets/sa.json`.
+To publish a build straight to a bucket, add `--publish-s3-bucket <b> --publish-s3-region <r>`
+(or `--publish-gcs-bucket <b>`) to `slater-build`; the remote `current` pointer is written
+last, so replicas never see a half-published generation. Details, including GCS settings
+and S3-compatible endpoints: [storage](https://github.com/Hikari-Systems/slater/blob/main/docs/manual/12-storage.md).
 
 ---
 
@@ -490,9 +417,8 @@ docker exec slater /app/slater healthcheck localhost 7687   # exit 0 = healthy
 --publish-s3-*  /  --publish-gcs-*    Also upload the generation to S3 / GCS
 ```
 
-Block-size and vector (Vamana/PQ) tuning flags are omitted above; both object-store
-backends are compiled into the published image, so the `--publish-s3-*` /
-`--publish-gcs-*` flags work out of the box. Run `--help` for the authoritative list:
+Run `--help` for the full list, or see the
+[build CLI reference](https://github.com/Hikari-Systems/slater/blob/main/docs/manual/06-build-cli-reference.md):
 
 ```bash
 docker run --rm --entrypoint /app/slater-build hikarisystems/slater:latest --help
@@ -574,10 +500,7 @@ volumes:
 Up to six engines, one single-client suite, graphs from a 62k-node toy to **Wikidata
 91.6M nodes / 1.5B edges**, each **measured in isolation**. slater is the **lowest-RSS
 engine at every scale** and the only one whose footprint tracks the *query working set*,
-not the graph. The latency figures are a fresh Slater 0.21.0 pass (the 91.6M row is a
-same-box, shared-anchor slater-vs-Neo4j comparison); resident-memory figures carry forward
-from the earlier cgroup-measured pass. Figures are medians (ms) or peak resident memory
-(MiB), slater on its local-filesystem (`fs`) backend.
+not the graph.
 
 ### Resident memory (MiB) — bounded as the graph grows ~1,500×
 
@@ -598,30 +521,14 @@ The in-memory trio (Memgraph · FalkorDB · ArcadeDB) cannot hold the 1.5B graph
 
 ### Latency highlights (median ms)
 
-slater owns the **metadata / index / scan** shapes (count, label, idx-eq, scan ~0.4 ms,
-10–200× the service engines), the **unanchored multi-hop** (MeSH 2-hop 1.40 ms), the
-**indexed point lookup** (0.43 ms, edging the in-memory pair), and whole-label **group-by /
-count(DISTINCT)** (0.45 ms, build-time histogram). At **91.6M ≫ RAM** — where only the
-disk-backed engines load the graph at all — a fresh same-box, shared-anchor pass has slater
-crushing `count` (**0.41 ms vs Neo4j 3.6 s**, ~8800×), point/degree/3-hop (~2–10×), even with
-Neo4j on 1–2-hop (fanout 8 pulls ahead), but **losing var-length `*1..2` distinct (~1 s vs
-Neo4j's 47 ms)** — an honest slater weak spot. kNN is 2.4–2.9 ms **exact** (recall 1.0) vs
-FalkorDB's 1.2 ms approximate HNSW.
+slater leads the **metadata / index / scan** shapes (~0.4 ms, 10–200× the service
+engines), the indexed point lookup (0.43 ms) and whole-label group-by (0.45 ms). At
+**91.6M ≫ RAM** it answers `count` in **0.41 ms vs Neo4j's 3.6 s** and wins point, degree
+and 3-hop by ~2–10×, but **loses var-length `*1..2` distinct (~1 s vs 47 ms)** — an honest
+weak spot. kNN is 2.4–2.9 ms **exact** (recall 1.0).
 
 Full per-engine tables (every shape, every graph) are in the
 [cross-engine benchmark README](https://github.com/Hikari-Systems/slater/tree/main/perf/cross-engine-hs).
-
----
-
-## Tags
-
-- `:latest` — the most recent release.
-- `:vX.Y.Z` — a specific release (e.g. `:v0.1.4`).
-
-Multi-arch: **linux/amd64** and **linux/arm64**.
-```bash
-docker pull hikarisystems/slater:latest
-```
 
 ---
 

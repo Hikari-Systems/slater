@@ -27,6 +27,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      # Docker Hub caps the overview at 25,000 characters and silently truncates
+      # anything longer, so fail loudly here instead of publishing a cut-off page.
+      - name: Check DOCKERHUB.md fits Docker Hub's 25,000-character limit
+        run: |
+          n=$(wc -m < DOCKERHUB.md)
+          echo "DOCKERHUB.md: $n characters"
+          if [ "$n" -gt 25000 ]; then
+            echo "::error file=DOCKERHUB.md::$n characters exceeds Docker Hub's 25,000 limit; the overview would be truncated. Move detail to docs/manual/ and link it."
+            exit 1
+          fi
+
       - name: Update Docker Hub overview from DOCKERHUB.md
         uses: peter-evans/dockerhub-description@v5
         with:
