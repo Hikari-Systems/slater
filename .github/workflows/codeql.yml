@@ -21,7 +21,7 @@ concurrency:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 60
     # security-events:write is required to upload the SARIF results; the rest are
     # read-only. No other GITHUB_TOKEN scope is needed.

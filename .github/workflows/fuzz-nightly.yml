@@ -16,8 +16,8 @@ name: fuzz-nightly
 #   * Scheduled workflows always run on the default branch (main), and caches
 #     created on the default branch are restorable from the tag pushes that drive
 #     release.yml — so accumulating here is exactly what the release gate needs.
-#   * runs-on: self-hosted-public-amd64 — the org's self-hosted runners; see the
-#     runner note in ci.yml for the per-runner Rust home and the missing sudo.
+#   * runs-on: blacksmith-2vcpu-ubuntu-2404; see the runner note in ci.yml for
+#     the per-runner Rust home and why no `sudo apt-get` is needed.
 on:
   schedule:
     # 04:37 UTC — off the top of the hour to dodge scheduler congestion/delay.
@@ -39,7 +39,7 @@ jobs:
   # The targets fan out one-per-runner across the matrix (as the release gate
   # does), so they fuzz in parallel and each persists its own corpus.
   fuzz:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     # 40 was ~1 minute of headroom and `parse_statement` finally crossed it on
     # 2026-08-07 (run 31152379917, cancelled mid cache-save at 40m22s; the night
     # before finished at 38m41s). That leg currently spends its whole

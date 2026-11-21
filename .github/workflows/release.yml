@@ -48,7 +48,7 @@ jobs:
   # publishes off a branch push.
   test:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Checkout the tag
@@ -112,7 +112,7 @@ jobs:
   # only its own leg while still blocking the release. cargo-fuzz needs nightly +
   # libFuzzer. amd64 only: the targets are pinned to x86_64-unknown-linux-gnu.
   fuzz:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -252,10 +252,10 @@ jobs:
           # no flag is needed there. (These match on `platform`, so they apply to
           # both variants of that arch.)
           - platform: amd64
-            runner: self-hosted-public-amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
             rustflags: "-Ctarget-cpu=x86-64-v3"
           - platform: arm64
-            runner: self-hosted-public-arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
             rustflags: ""
           # Per-variant Dockerfile (match on `variant`, so they apply to both
           # arches of that variant).
@@ -312,7 +312,7 @@ jobs:
   #   * full → :<tag>      + :latest
   #   * lite → :<tag>-lite + :latest-lite
   docker-manifest:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     needs: docker-build
     strategy:
@@ -389,7 +389,7 @@ jobs:
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:
     needs: [test, fuzz]
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     env:
       # The tag this run targets: the pushed ref, or the manual dispatch input.
       TAG: ${{ github.event.inputs.tag || github.ref_name }}

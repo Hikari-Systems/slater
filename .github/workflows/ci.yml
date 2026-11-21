@@ -28,9 +28,9 @@ concurrency:
 permissions:
   contents: read
 
-# Runs on the org's self-hosted public runners: amd64 jobs on
-# `self-hosted-public-amd64` (two runners on one persistent host, as one user)
-# and, in release.yml, the arm64 image build on `self-hosted-public-arm64`. So:
+# Runs on Blacksmith runners: amd64 jobs on `blacksmith-2vcpu-ubuntu-2404` and,
+# in release.yml, the arm64 image build on `blacksmith-2vcpu-ubuntu-2404-arm`.
+# The jobs are also written to be safe on shared, persistent runners, so:
 #   * one Rust home per runner (RUSTUP_HOME/CARGO_HOME named for $RUNNER_NAME):
 #     two jobs installing into one ~/.rustup at once break each other ("could not
 #     rename component file ... Directory not empty");
@@ -44,7 +44,7 @@ permissions:
 jobs:
   # ── Formatting: mirror the local pre-commit hook (.githooks/pre-commit) ─────
   fmt:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -77,7 +77,7 @@ jobs:
 
   # ── Clippy: mirror the local pre-commit hook (.githooks/pre-commit) ────────
   clippy:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -115,7 +115,7 @@ jobs:
 
   # ── Build: the whole workspace must compile against the committed lockfile ──
   build:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -144,7 +144,7 @@ jobs:
   # compiled and linted clean but broke a unit test could merge green and surface
   # only at release; running it on every commit closes that gap.
   test:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -199,7 +199,7 @@ jobs:
   #    `--features`, so it is never compiled. It was previously believed to be the
   #    reason a blanket `--ignored` was impossible here. It was not.
   consolidation:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -258,7 +258,7 @@ jobs:
   #    Each backend is exercised alone and together, so a feature that only
   #    compiles alongside the other is still caught.
   store-backends:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
     strategy:
       fail-fast: false
