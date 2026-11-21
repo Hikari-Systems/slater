@@ -233,13 +233,12 @@ pub fn streaming_merge(
     // (`compose_final_ids`), and handing a dead record a *live* id would resurrect whatever
     // stale geometry the hole still carries — with a plausible score and no error. Reject that
     // composition bug here, at the boundary, rather than emit a silently-wrong index.
-    for i in 0..base_count {
+    for (i, &final_id) in inputs.base_final_ids[..base_count].iter().enumerate() {
         if base_pq.is_hole(i) {
             ensure!(
-                inputs.base_final_ids[i] == HOLE,
+                final_id == HOLE,
                 "base layout ordinal {i} is a pre-existing hole, but base_final_ids assigns it a \
-                 live id ({}) — a hole cannot be relabelled live; its geometry is stale",
-                inputs.base_final_ids[i]
+                 live id ({final_id}) — a hole cannot be relabelled live; its geometry is stale"
             );
         }
     }
@@ -360,10 +359,10 @@ pub fn streaming_merge(
         base_cache: RefCell::new(HashMap::new()),
     };
     let mut expanded = Expanded::Set(Default::default());
-    for k in 0..inputs.inserts.len() {
+    for (k, insert) in inputs.inserts.iter().enumerate() {
         let p = (base_count + k) as VamanaIndex;
         merge_insert(p, &mut adj, &points, &dead, params, &mut expanded)
-            .with_context(|| format!("insert Δ vector {k} (dense id {})", inputs.inserts[k].0))?;
+            .with_context(|| format!("insert Δ vector {k} (dense id {})", insert.0))?;
     }
 
     // ── Emit: one sequential pass. Base records keep their raw vector and take their patched
