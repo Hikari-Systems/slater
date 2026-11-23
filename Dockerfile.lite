@@ -110,7 +110,21 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
 # ── Real build ────────────────────────────────────────────────────────────────
 # Only the server binary, filesystem backend only (no `--features`).
 COPY crates ./crates
-RUN cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" -p slater --bin slater
+# `touch` first, or this step can silently relink the STUBS. COPY keeps the
+# build context's mtimes, and cargo judges a path crate fresh when its sources are
+# older than its last build, which here is the stub build of the cache layer
+# above. With a cold layer cache (the stub layer built in this same run) every
+# real source is older than it. cargo then skipped graph-format and slater
+# entirely: the lite image shipped a 280 KB `fn main() {}` as `slater`, and the
+# full build failed linking slater-build against the empty stub graph-format.
+# A warm cache (the stub layer older than the checkout) hid it. Touching makes
+# the order explicit instead of a property of the cache.
+# And prove it, without running anything: release builds target x86-64-v3, which
+# the Ivy Bridge builder cannot execute (SIGILL; see the --target note above). A stub
+# `fn main() {}` does not contain the help banner's text; the real binary does.
+RUN find crates -type f -exec touch {} + \
+    && cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" -p slater --bin slater \
+    && grep -qa 'read-only Bolt graph engine' target/*/release/slater
 
 # Minimal glibc (non-musl) runtime: Debian 12 distroless ships glibc +
 # libgcc/libstdc++ + ca-certificates and nothing else (no shell/apt/coreutils), so

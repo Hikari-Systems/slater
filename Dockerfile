@@ -116,8 +116,23 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
 # here; build it on demand with
 # `cargo build -p slater-build --features bench-codec --bin bench-codec`.
 COPY crates ./crates
-RUN cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
-        --bin slater --bin slater-build
+# `touch` first, or this step can silently relink the STUBS. COPY keeps the
+# build context's mtimes, and cargo judges a path crate fresh when its sources are
+# older than its last build, which here is the stub build of the cache layer
+# above. With a cold layer cache (the stub layer built in this same run) every
+# real source is older than it. cargo then skipped graph-format and slater
+# entirely: the lite image shipped a 280 KB `fn main() {}` as `slater`, and the
+# full build failed linking slater-build against the empty stub graph-format.
+# A warm cache (the stub layer older than the checkout) hid it. Touching makes
+# the order explicit instead of a property of the cache.
+# And prove it, without running anything: release builds target x86-64-v3, which
+# the Ivy Bridge builder cannot execute (SIGILL; see the --target note above). A stub
+# `fn main() {}` does not contain the help banner's text; the real binary does.
+RUN find crates -type f -exec touch {} + \
+    && cargo build --release --locked --target "$(rustc -vV | sed -n 's/^host: //p')" ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
+        --bin slater --bin slater-build \
+    && grep -qa 'read-only Bolt graph engine' target/*/release/slater \
+    && grep -qa 'Slater offline writer' target/*/release/slater-build
 
 # Empty directories for the runtime stage to copy in as the writable mount points
 # (see the COPY --chown below) — a distroless stage has no shell to mkdir with.
