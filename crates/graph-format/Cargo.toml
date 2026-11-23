@@ -52,8 +52,13 @@ crc32c = "0.6"
 # the only client that surfaces S3 object checksums (`x-amz-checksum-sha256`) on
 # put/head; it is async, so `store::s3` bridges it with an owned current-thread
 # runtime — contained entirely in that module, the storage trait stays sync.
-aws-config = { version = "1", optional = true }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
+#
+# No `default-https-client` on either: it hard-codes rustls over aws-lc-rs, and
+# slater keeps exactly one TLS crypto provider (`ring`; see the workspace
+# Cargo.toml). `store::s3` hands the loader an explicit `rustls-ring` client.
+aws-config = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", optional = true, default-features = false, features = ["rustls-ring"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
 # GCS backend (optional). `gcloud-storage` talks to GCS over the **JSON API**
 # (not gRPC), which surfaces the object `crc32c` checksum on get/list, validates an
@@ -63,7 +68,20 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
 # `fake-gcs-server` both serve) is what lets one code path work against the
 # emulator and production alike. It is async, bridged by the same owned runtime as
 # S3 via `store::asyncbridge`.
-gcloud-storage = { version = "1", optional = true }
+#
+# Default features off: they select reqwest's aws-lc-rs TLS provider.
+# `rustls-no-provider` makes reqwest use the process-default provider, which
+# `store::gcs::connect` installs (`ring`) before building the client — reqwest
+# PANICS at client build if none is installed.
+#
+# JWT signing (service-account auth) stays on `jwt-aws-lc-rs`: jsonwebtoken 10
+# has only two backends, and the other (`jwt-rust-crypto`) brings back `rsa` 0.9
+# (RUSTSEC-2023-0071, Marvin, unfixed) and crypto-bigint 0.5 (RUSTSEC-2026-0387,
+# unfixed — removed on purpose in 1597a88). So with `gcs` on, aws-lc-rs is still
+# compiled, but only as a signing library, never as a rustls provider; the CI
+# guard allows exactly that edge and nothing else.
+gcloud-storage = { version = "1", optional = true, default-features = false, features = ["auth", "rustls-no-provider", "jwt-aws-lc-rs"] }
+rustls = { workspace = true, optional = true }
 # Per-file checksum for the network-backend local-disk block cache
 # (`store::diskcache`), verified on every read to self-heal a corrupt cache file
 # (→ object-store refetch). A plain CRC-32 detects bit-rot/torn writes; it is not a
@@ -75,10 +93,10 @@ crc32fast = { version = "1", optional = true }
 default = []
 # Enable the S3 / object-store backend (`store::s3::S3ObjectStore`) and the shared
 # local-disk block cache (`store::diskcache::CachingObjectStore`).
-s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio", "dep:crc32fast"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client", "dep:tokio", "dep:crc32fast"]
 # Enable the GCS backend (`store::gcs::GcsObjectStore`) and the same shared
 # local-disk block cache.
-gcs = ["dep:gcloud-storage", "dep:tokio", "dep:crc32fast"]
+gcs = ["dep:gcloud-storage", "dep:rustls", "dep:tokio", "dep:crc32fast"]
 
 [dev-dependencies]
 criterion.workspace = true

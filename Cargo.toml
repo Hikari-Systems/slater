@@ -21,7 +21,7 @@ license = "Apache-2.0"
 # Shared house utilities: config layering, logging init, deserialisers.
 # config/logging/healthcheck are NOT feature-gated, so default-features = false
 # pulls none of the actix/sqlx stack — exactly what a Bolt server wants.
-hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.17.0", default-features = false }
+hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.42.0", default-features = false, features = ["otel"] }
 
 # Workspace-internal.
 graph-format = { path = "crates/graph-format" }
@@ -38,8 +38,18 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Async + server (slater).
 tokio = { version = "1", features = ["full"] }
-rustls = "0.23"
-tokio-rustls = "0.26"
+# TLS: ONE crypto provider, `ring`, everywhere in the dependency graph.
+# Default features are off on purpose: rustls (and tokio-rustls) default to
+# aws-lc-rs, and the OTLP exporter in hs-utils compiles rustls with `ring`. With
+# both providers compiled in, rustls can no longer pick a process default on its
+# own, and `ServerConfig::builder()` panics at the first TLS listen. `ring` wins
+# because hs-utils hard-wires it, and because it builds without the AWS-LC C/C++
+# toolchain (cmake, NASM). The same rule binds the object-store clients in
+# graph-format: S3 gets an explicit `rustls-ring` smithy client, and GCS runs
+# reqwest with `rustls-no-provider` and signs its JWTs with RustCrypto.
+# `.github/scripts/check_single_tls_provider.sh` (CI) fails if aws-lc-rs comes back.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
 # Test-only: mints a throwaway self-signed cert so the TLS accept path can be driven in a
 # unit test (the slow-loris handshake guard) without committing key material to the repo.

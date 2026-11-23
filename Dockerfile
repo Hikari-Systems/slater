@@ -33,9 +33,10 @@ ENV RUSTFLAGS=$RUSTFLAGS
 # single backend (e.g. `slater/gcs,slater-build/gcs`).
 ARG CARGO_FEATURES="slater/s3,slater-build/s3,slater/gcs,slater-build/gcs"
 
-# Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
-# C/C++ toolchain (clang), and libclang for its bindgen step. Without these the
-# rustls/aws-lc-rs build fails. `git` is already present in rust:1-bookworm and is
+# Build deps for aws-lc-rs: cmake + a C/C++ toolchain (clang), and libclang for
+# its bindgen step. TLS no longer uses it (rustls runs on ring alone — see the
+# workspace Cargo.toml); it remains only as the `gcs` backend's JWT-signing
+# library (jsonwebtoken), so a `CARGO_FEATURES` without `gcs` needs none of this. `git` is already present in rust:1-bookworm and is
 # required because `.cargo/config.toml` forces the git CLI for the `hs-utils`
 # git+tag fetch (libgit2's transport is unreliable in this environment).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Dependency cache layer ────────────────────────────────────────────────────
 # Copy only the manifests (+ the lockfile and the cargo config that forces the
 # git CLI), synthesise stub sources for every workspace crate, and build once so
-# the heavy dependency graph (tokio, rustls/aws-lc-rs, zstd, argon2, …) is cached
+# the heavy dependency graph (tokio, rustls, zstd, argon2, …) is cached
 # in its own layer. Editing `crates/*/src` afterwards only recompiles our code.
 #
 # INVARIANT: the stub list below must name a file for EVERY [[bench]], [[test]],

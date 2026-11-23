@@ -36,7 +36,7 @@ permissions:
 #     rename component file ... Directory not empty");
 #   * no `sudo apt-get`: the runner user has no sudo. The cmake/clang/libclang the
 #     GitHub-hosted jobs used to install are not needed outside Docker — on
-#     x86_64 Linux aws-lc-sys (rustls) and zstd-sys build with the host's C compiler
+#     x86_64 Linux aws-lc-sys (gcs JWT signing only) and zstd-sys build with the host's C compiler
 #     alone; cmake and libclang are only for aws-lc-sys's CMake builder and bindgen,
 #     which this target does not use. Every cargo job runs on amd64; the arm64
 #     runner only runs the Docker build, and the Dockerfiles install their own.
@@ -74,6 +74,13 @@ jobs:
       # someone can forget. Lives in the fmt job because it needs no toolchain or build.
       - name: Dockerfile dep-cache stub lists cover every declared target
         run: python3 .github/scripts/check_dockerfile_stubs.py
+
+      # ring must be the only rustls crypto provider. A second one compiled in
+      # (aws-lc-rs is the default of rustls and of several SDKs) makes rustls
+      # unable to pick a process default, and the TLS listener then PANICS at
+      # boot — a failure no compile step or test with TLS off would notice.
+      - name: ring is the only rustls crypto provider
+        run: .github/scripts/check_single_tls_provider.sh
 
   # ── Clippy: mirror the local pre-commit hook (.githooks/pre-commit) ────────
   clippy:

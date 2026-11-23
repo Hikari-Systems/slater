@@ -30,13 +30,12 @@ ENV RUSTFLAGS=$RUSTFLAGS
 # with SIGILL on a pre-Haswell builder (the self-hosted runner is Ivy Bridge).
 # Outputs land in target/<triple>/release, hence the `target/*/release` globs.
 
-# Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
-# C/C++ toolchain (clang) + libclang for its bindgen step. `git` is already in
-# rust:1-bookworm and is required by `.cargo/config.toml` for the `hs-utils`
-# git+tag fetch.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake clang libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
+# No extra build packages. TLS runs on rustls+ring only (see the workspace
+# Cargo.toml), and this image builds no `--features`, so aws-lc-sys — the only
+# crate that wanted cmake/clang/libclang — is not in its dependency graph at all
+# (`.github/scripts/check_single_tls_provider.sh` enforces that). ring and
+# zstd-sys build with the gcc already in rust:1-bookworm, as does `git`, which
+# `.cargo/config.toml` needs for the `hs-utils` git+tag fetch.
 
 # ── Dependency cache layer ────────────────────────────────────────────────────
 # Copy only the manifests (+ lockfile + the cargo config that forces the git CLI),

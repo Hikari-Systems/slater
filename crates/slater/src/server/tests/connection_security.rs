@@ -225,7 +225,8 @@ async fn global_connection_cap_blocks_until_a_slot_frees() {
 fn test_tls_acceptor() -> TlsAcceptor {
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
-    let config = rustls::ServerConfig::builder()
+    let config = crate::server::listen::server_config_builder()
+        .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![issued.cert.der().clone()], key.into())
         .unwrap();
@@ -524,4 +525,62 @@ async fn per_ip_cap_rejects_excess_from_one_source() {
         Ok(Ok(_)) => panic!("second connection from the same source should be rejected"),
         Err(_) => panic!("server neither served nor rejected the per-IP excess"),
     }
+}
+
+/// The PRODUCTION TLS path — `build_tls_acceptor` from PEM files on disk, the
+/// function `serve` calls — completes a real handshake. `test_tls_acceptor` above
+/// builds its config in-process, so before this test nothing exercised the
+/// builder `serve` actually uses: when the OTLP exporter brought a second rustls
+/// crypto provider into the build, that builder panicked at boot ("Could not
+/// automatically determine the process-level CryptoProvider") while every TLS
+/// test stayed green. Run with no provider installed, as a server with
+/// `otel.enabled=false` runs.
+#[tokio::test]
+async fn the_configured_tls_acceptor_completes_a_handshake() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = std::env::temp_dir().join(format!("slater_tls_acceptor_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+    std::fs::write(&cert_path, issued.cert.pem()).unwrap();
+    std::fs::write(&key_path, issued.key_pair.serialize_pem()).unwrap();
+    let tls = TlsConfig {
+        cert: cert_path.to_string_lossy().into_owned(),
+        key: key_path.to_string_lossy().into_owned(),
+    };
+    let acceptor = build_tls_acceptor(&tls)
+        .unwrap()
+        .expect("TLS is configured");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(sock).await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(&buf).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(issued.cert.der().clone()).unwrap();
+    let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut stream = connector.connect(name, sock).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+    server.await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -678,11 +678,26 @@ pub(crate) fn build_tls_acceptor(tls: &TlsConfig) -> Result<Option<TlsAcceptor>>
     }
     let certs = load_certs(&tls.cert)?;
     let key = load_key(&tls.key)?;
-    let config = rustls::ServerConfig::builder()
+    let config = server_config_builder()?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("build rustls server config")?;
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+/// A `ServerConfig` builder over an explicitly named crypto provider (`ring`).
+///
+/// Not `ServerConfig::builder()`: that resolves the *process-default* provider,
+/// which panics if a second provider is ever compiled in and none is installed —
+/// exactly what happened when hs-utils' OTLP exporter brought `ring` in beside
+/// rustls' default aws-lc-rs (it booted with `otel.enabled` and panicked
+/// without). The workspace now compiles `ring` alone, but naming it here keeps
+/// the listener correct even if a dependency drags another provider back in.
+pub(crate) fn server_config_builder(
+) -> Result<rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier>> {
+    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("select TLS protocol versions")
 }
 
 pub(crate) fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {

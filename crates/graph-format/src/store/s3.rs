@@ -160,7 +160,18 @@ impl S3ObjectStore {
             _ => None,
         };
         let client = run_blocking(&rt, async move {
-            let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+            // An explicit HTTPS client over rustls+ring: the SDK's default client
+            // is built on aws-lc-rs, which slater does not compile in (one TLS
+            // provider for the whole binary — see the workspace Cargo.toml). Set
+            // on the shared loader so the credential providers (SSO, IMDS, STS)
+            // use it too, not only the S3 client.
+            let http = aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                ))
+                .build_https();
+            let mut loader =
+                aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http);
             if !region.is_empty() {
                 loader = loader.region(Region::new(region));
             }
@@ -591,5 +602,59 @@ mod tests {
         assert!(checked_content_length(Some(i64::MIN), "HEAD x").is_err());
         assert_eq!(checked_content_length(Some(0), "HEAD x").unwrap(), 0);
         assert_eq!(checked_content_length(Some(4096), "HEAD x").unwrap(), 4096);
+    }
+
+    /// Accept ONE connection on a loopback socket and report the first byte the
+    /// client sent. `0x16` is a TLS handshake record — a ClientHello — so seeing it
+    /// proves the client built its rustls config and started a handshake. No TLS
+    /// server, no certificate and no network: the socket is dropped right after.
+    fn first_byte_of_one_connection() -> (u16, std::sync::mpsc::Receiver<Option<u8>>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let byte = listener.accept().ok().and_then(|(mut sock, _)| {
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok()?;
+                let mut b = [0u8; 1];
+                sock.read_exact(&mut b).ok().map(|()| b[0])
+            });
+            let _ = tx.send(byte);
+        });
+        (port, rx)
+    }
+
+    /// The S3 client speaks TLS over rustls+ring. Its SDK default client is built
+    /// on aws-lc-rs, which slater no longer compiles in; `connect` must hand the
+    /// loader an explicit ring client, or the first HTTPS request fails (or, with
+    /// two providers compiled in, panics). The real-S3 tests need MinIO, so
+    /// without this nothing in CI ever builds an S3 HTTPS client.
+    #[test]
+    fn https_requests_start_a_tls_handshake_over_ring() {
+        let (port, first_byte) = first_byte_of_one_connection();
+        let store = super::S3ObjectStore::connect(&super::S3Config {
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            endpoint: Some(format!("https://127.0.0.1:{port}")),
+            prefix: String::new(),
+            path_style: true,
+            access_key: Some("AKIDEXAMPLE".into()),
+            secret_key: Some("secret".into()),
+            session_token: None,
+        })
+        .expect("connect");
+        use crate::store::ObjectStore as _;
+        assert!(
+            store.exists("k").is_err(),
+            "nothing answers TLS on the socket"
+        );
+        assert_eq!(
+            first_byte
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap(),
+            Some(0x16),
+            "the S3 client must open with a TLS ClientHello"
+        );
     }
 }

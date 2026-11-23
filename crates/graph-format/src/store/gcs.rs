@@ -103,6 +103,13 @@ fn is_not_found(e: &GcsError) -> bool {
 impl GcsObjectStore {
     /// Connect to the bucket described by `cfg`.
     pub fn connect(cfg: &GcsConfig) -> Result<Self> {
+        // gcloud-storage runs reqwest with `rustls-no-provider`, which takes the
+        // process-default crypto provider and PANICS at client build when none is
+        // installed. Install `ring` (slater's only provider) here rather than in
+        // each binary's `main`, so every caller — server, slater-build, tests — is
+        // covered. `Err` means a default is already installed; it is ring too,
+        // since no other provider is compiled in.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // A small dedicated runtime drives the async client; synchronous callers
         // dispatch onto it via `run_blocking` (never `block_on`), so the bridge
         // works from the server's main runtime (graph open) and from
@@ -594,5 +601,54 @@ mod tests {
         // intended behaviour regardless of what the object happens to carry.
         assert_eq!(plan_verify(None, None), VerifyPlan::Complete);
         assert_eq!(plan_verify(None, Some("kZ4v5w==")), VerifyPlan::Complete);
+    }
+
+    /// Accept ONE connection on a loopback socket and report the first byte the
+    /// client sent. `0x16` is a TLS handshake record — a ClientHello — so seeing it
+    /// proves the client built its rustls config and started a handshake. No TLS
+    /// server, no certificate and no network: the socket is dropped right after.
+    fn first_byte_of_one_connection() -> (u16, std::sync::mpsc::Receiver<Option<u8>>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let byte = listener.accept().ok().and_then(|(mut sock, _)| {
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok()?;
+                let mut b = [0u8; 1];
+                sock.read_exact(&mut b).ok().map(|()| b[0])
+            });
+            let _ = tx.send(byte);
+        });
+        (port, rx)
+    }
+
+    /// The GCS client runs reqwest with `rustls-no-provider`, which PANICS at
+    /// client build unless a process-default crypto provider is installed —
+    /// `connect` installs ring. The other GCS tests need an emulator or real GCS,
+    /// so without this nothing in CI ever builds a GCS HTTPS client.
+    #[test]
+    fn https_requests_start_a_tls_handshake_over_ring() {
+        let (port, first_byte) = first_byte_of_one_connection();
+        let store = super::GcsObjectStore::connect(&super::GcsConfig {
+            bucket: "b".into(),
+            endpoint: Some(format!("https://127.0.0.1:{port}")),
+            anonymous: true,
+            ..Default::default()
+        })
+        .expect("connect");
+        use crate::store::ObjectStore as _;
+        assert!(
+            store.exists("k").is_err(),
+            "nothing answers TLS on the socket"
+        );
+        assert_eq!(
+            first_byte
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap(),
+            Some(0x16),
+            "the GCS client must open with a TLS ClientHello"
+        );
     }
 }
