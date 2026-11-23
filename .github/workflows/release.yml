@@ -48,7 +48,7 @@ jobs:
   # publishes off a branch push.
   test:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-heavy'] || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout the tag
@@ -112,7 +112,7 @@ jobs:
   # only its own leg while still blocking the release. cargo-fuzz needs nightly +
   # libFuzzer. amd64 only: the targets are pinned to x86_64-unknown-linux-gnu.
   fuzz:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-long'] || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -233,7 +233,7 @@ jobs:
   # refuses.
   docker-build:
     needs: [test, fuzz]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')[matrix.runner] || (contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || 'ubuntu-latest') }}
     # Slater is a heavy Rust build (rustls/aws-lc-rs, tokio, zstd, argon2); give
     # each native arch plenty of wall-clock.
     timeout-minutes: 90
@@ -252,10 +252,10 @@ jobs:
           # no flag is needed there. (These match on `platform`, so they apply to
           # both variants of that arch.)
           - platform: amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: linux-x64-build
             rustflags: "-Ctarget-cpu=x86-64-v3"
           - platform: arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: linux-arm64-build
             rustflags: ""
           # Per-variant Dockerfile (match on `variant`, so they apply to both
           # arches of that variant).
@@ -312,7 +312,7 @@ jobs:
   #   * full → :<tag>      + :latest
   #   * lite → :<tag>-lite + :latest-lite
   docker-manifest:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-light'] || 'ubuntu-latest' }}
     timeout-minutes: 15
     needs: docker-build
     strategy:
@@ -389,7 +389,7 @@ jobs:
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:
     needs: [test, fuzz]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-x64-build'] || 'ubuntu-latest' }}
     env:
       # The tag this run targets: the pushed ref, or the manual dispatch input.
       TAG: ${{ github.event.inputs.tag || github.ref_name }}

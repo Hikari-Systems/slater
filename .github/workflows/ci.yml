@@ -44,7 +44,7 @@ permissions:
 jobs:
   # ── Formatting: mirror the local pre-commit hook (.githooks/pre-commit) ─────
   fmt:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-light'] || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -77,7 +77,7 @@ jobs:
 
   # ── Clippy: mirror the local pre-commit hook (.githooks/pre-commit) ────────
   clippy:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-heavy'] || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -115,7 +115,7 @@ jobs:
 
   # ── Build: the whole workspace must compile against the committed lockfile ──
   build:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-heavy'] || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -144,7 +144,7 @@ jobs:
   # compiled and linted clean but broke a unit test could merge green and surface
   # only at release; running it on every commit closes that gap.
   test:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-heavy'] || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -199,7 +199,7 @@ jobs:
   #    `--features`, so it is never compiled. It was previously believed to be the
   #    reason a blanket `--ignored` was impossible here. It was not.
   consolidation:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-heavy'] || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -258,7 +258,7 @@ jobs:
   #    Each backend is exercised alone and together, so a feature that only
   #    compiles alongside the other is still caught.
   store-backends:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-heavy'] || 'ubuntu-latest' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false

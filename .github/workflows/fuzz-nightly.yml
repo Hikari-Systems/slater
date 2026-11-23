@@ -39,7 +39,7 @@ jobs:
   # The targets fan out one-per-runner across the matrix (as the release gate
   # does), so they fuzz in parallel and each persists its own corpus.
   fuzz:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')['linux-any-long'] || 'ubuntu-latest' }}
     # 40 was ~1 minute of headroom and `parse_statement` finally crossed it on
     # 2026-08-07 (run 31152379917, cancelled mid cache-save at 40m22s; the night
     # before finished at 38m41s). That leg currently spends its whole
