@@ -172,6 +172,29 @@ the layering); it takes no CLI flags.
 > `delta.builderThreads` at `0` sizes the child from the server's own cgroup limits,
 > which is the right answer for almost every containerised deployment.
 
+## `otel.*`
+
+OpenTelemetry export: traces and metrics over OTLP/HTTP-protobuf. Off by default:
+nothing is exported, and no exporter thread starts, until `otel.enabled` is set.
+What is exported is described in
+[13 Deployment](13-deployment.md#opentelemetry-traces-and-metrics). A
+consolidation's `slater-build` child reads this same block.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `otel.enabled` | `false` | Master switch. |
+| `otel.endpoint` | `https://api.honeycomb.io` | OTLP base URL; `/v1/traces` and `/v1/metrics` are appended. A Collector is typically `http://<host>:4318`. |
+| `otel.apiKey` | (empty) | Sent as `x-honeycomb-team`. Use `[SECRET]:/path`. Empty disables export (with a warning) unless `apiKeyRequired` is `false`. |
+| `otel.apiKeyRequired` | `true` | Set `false` for a Collector endpoint that holds the key. |
+| `otel.serviceName` | `slater` | `service.name`. The build reports as `<serviceName>-build`. |
+| `otel.environment` | (empty) | `deployment.environment.name` (`preview`, `prod`). |
+| `otel.sampleRatio` | `1.0` | Head sampling, 0.0–1.0, parent-based. |
+| `otel.level` | (the log level) | What is exported, as a filter directive (`info`, `info,slater=debug`), independent of `log.level`. |
+| `otel.metricsEnabled` | `true` | Export metrics as well as traces. |
+| `otel.metricsIntervalSecs` | `60` | Metric collection and export interval. |
+| `otel.processMetrics` | `true` | Process and container CPU, memory, I/O and pressure-stall gauges. |
+| `otel.metricsDataset` | (empty) | Sent as `x-honeycomb-dataset` on metric exports (legacy dataset routing). |
+
 ## Next
 
 - Apply these safely: [15 Security](15-security.md).

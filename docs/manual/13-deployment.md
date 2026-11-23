@@ -124,11 +124,103 @@ INFO query executed graph=social cost=0 rows=1 result_cache="miss" exec_ms=0.0 e
 
 `debug` adds wire- and SDK-level tracing. Failed queries log at `warn`.
 
-**There is no HTTP `/metrics` endpoint.** Operational metrics are exposed only
-through `CALL slater.diagnostics()` (or the `slater diagnostics` subcommand),
-gated behind `loadTestDiagnostics=true`. See
+Log lines emitted inside a request or a build phase are prefixed with that span,
+e.g. `bolt.run{otel.kind="server"}: query executed …` or
+`slater_build.run:slater_build.phase{otel.name=build.pass1}: ▶ starting pass 1`.
+The prefix is there whether or not OpenTelemetry export is enabled.
+
+**There is no HTTP `/metrics` endpoint.** Metrics are *pushed* over OTLP when
+OpenTelemetry is enabled (below). For load testing, `CALL slater.diagnostics()`
+(or the `slater diagnostics` subcommand) is gated behind
+`loadTestDiagnostics=true`; see
 [09 Procedures & algorithms](09-procedures-and-algorithms.md) and
 [15 Security](15-security.md).
+
+### OpenTelemetry (traces and metrics)
+
+Both `slater` and `slater-build` can export traces and metrics over OTLP/HTTP
+(protobuf) to Honeycomb, or to any OpenTelemetry Collector. Export is **off by
+default**: until `otel.enabled` is set, no exporter thread is started and nothing
+leaves the process.
+
+```json
+{
+  "otel": {
+    "enabled": "true",
+    "endpoint": "https://api.honeycomb.io",
+    "apiKey": "[SECRET]:/run/secrets/honeycomb-api-key",
+    "serviceName": "slater",
+    "environment": "preview",
+    "sampleRatio": "1.0"
+  }
+}
+```
+
+The same keys work as environment overrides (`otel__enabled=true`,
+`otel__endpoint=…`). Use the `[SECRET]:` file indirection for `apiKey`, never an
+inline key. To send to a local Collector that holds the key itself, set
+`"endpoint": "http://collector:4318"` and `"apiKeyRequired": "false"`. Every key
+is listed in [14 Configuration reference](14-configuration-reference.md#otel).
+
+**What a trace looks like.** Each Bolt `RUN` is one trace, and so is each
+authenticating `HELLO`/`LOGON`. A connection is *not* a span: driver pools hold
+connections open for hours, which would bury every request in one huge trace.
+
+```
+bolt.run                  server span: db.namespace, db.operation.name, db.query.text,
+│                                      enduser.id, client.address, error.type
+├─ slater.parse           parse, on the blocking pool (slater.parse.ok)
+├─ slater.execute         result-cache hit, cost, rows, block-cache hits/misses
+├─ slater.encode          PackStream encoding of the result
+├─ slater.write           a write statement: WAL append + fsync + memtable apply
+└─ slater.consolidate     CALL slater.consolidate() (or an automatic one, as its own root)
+   └─ slater.builder      the slater-build child process (process.exit.code)
+      └─ slater_build.run                ← exported by the child, same trace
+         ├─ build.ingest / build.pass1 / build.resolve / build.cluster
+         ├─ build.emit.topology / build.emit.node_stores / …
+         └─ build.publish
+bolt.logon                └─ slater.auth.verify (argon2id)
+slater.generation.swap    a reloadStrategy=swap generation swap (background root)
+slater.delta.flush / slater.delta.compact   writable-layer maintenance
+```
+
+A consolidation is **one trace across two processes**. The server passes its
+trace context to the `slater-build` child in the `TRACEPARENT` environment
+variable, and the child reads the same `otel` block (it inherits the server's
+working directory and environment) and reports as `<serviceName>-build`.
+
+**Errors.** Span status is set to ERROR only for server failures, which covers
+every execution failure: budget trips, timeouts, a task that died. Bad input
+(wrong credentials, a missing grant, an unknown graph, a syntax error, a write on
+a read-only connection) is recorded as `error.type` but leaves the status unset,
+so the error rate counts what the server got wrong.
+
+**Metrics.** Pushed every `metricsIntervalSecs` (default 60):
+
+| Metric | Unit | Attributes |
+|---|---|---|
+| `slater.request.duration` | s | `db.namespace`, `db.operation.name`, `outcome` (`ok`/`client_error`/`error`) |
+| `slater.block_cache.accesses` | `{access}` | `db.namespace`, `result` (`hit`/`miss`) |
+| `slater.result_cache.lookups` | `{lookup}` | `db.namespace`, `result` |
+| `slater.consolidation.duration` | s | `db.namespace`, `outcome` |
+
+The process and container CPU, memory, disk I/O and pressure-stall gauges
+(`processMetrics`) come with the exporter, and are reported by the build too:
+a long consolidation shows its resource curve in the build's own service. Metric
+attributes are bounded: graphs are the served set, operations a fixed list.
+
+**What is exported.** Query text is exported in the same one-line form, truncated
+to 160 characters, that the `query executed` log line already prints. Query
+**parameters are never recorded as attributes**. A failed execution's error message
+(truncated to 512 characters) becomes the span status, and like the `query failed`
+log line it can quote a value the query touched, parameters included. Spans also
+carry the authenticated user (`enduser.id`, recorded only once a `LOGON` succeeds)
+and the client address. See [15 Security](15-security.md).
+
+**Shutdown.** With export enabled, `SIGTERM`/`SIGINT` flush queued spans and
+metrics before the process exits (with the signal's usual status, 143 or 130). The
+last seconds before a stop are usually the ones you want. With export off, a
+signal behaves exactly as before.
 
 ## Next
 

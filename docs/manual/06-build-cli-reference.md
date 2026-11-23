@@ -116,6 +116,35 @@ by these flags (it takes no config file).
 | `SLATER_BUILD_DIAG=1` | Enable diagnostics (same as `--diagnostics`). |
 | `SLATER_BUILD_FAIL_AFTER=<phase>` | Test-only: crash after a named phase (for exercising `--resume`). |
 | `SLATER_SHARD_BYTES=<N>` | Pass-1 shard target size. |
+| `otel__*` | OpenTelemetry export; see below. |
+| `TRACEPARENT` / `TRACESTATE` | W3C trace context: make the build a child of that trace. |
+
+## Telemetry (OpenTelemetry)
+
+`slater-build` exports a trace per build when the `otel` block enables it: a
+`slater_build.run` span, with one child span per phase (`build.pass1`,
+`build.resolve`, `build.cluster`, `build.emit.topology`, …, `build.publish`), plus
+the process CPU, memory, I/O and pressure-stall metrics. With `--diagnostics`, each
+phase span also carries that phase's CPU time, disk read/write bytes and peak RSS.
+
+It reads the server's `otel` block from the server's places: `/app/config.json`
+(else `./config.json`), then the `${CONFIG_PATH:-/sandbox}/config.json` overlay, then
+`otel__*` environment overrides. Unlike the server, every file is optional, and
+only the `otel` block is read; the rest of the file (and any other secret it
+references) is not. So a standalone build is switched on from the environment:
+
+```bash
+otel__enabled=true otel__endpoint=https://api.honeycomb.io \
+otel__apiKey='[SECRET]:/run/secrets/honeycomb-api-key' otel__serviceName=slater \
+  slater-build --input graph.cypher --graph people --data-dir /data
+```
+
+A consolidation's builder needs nothing extra. It inherits the server's working
+directory and environment, so it exports when the server does and joins the
+server's trace through `TRACEPARENT`. It reports as `<serviceName>-build`
+(`slater-build` when no name is set). `--quiet` silences stdout only; export, if
+enabled, still runs. Keys are listed in
+[14 Configuration reference](14-configuration-reference.md#otel).
 
 ## Cargo features
 

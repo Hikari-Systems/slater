@@ -141,6 +141,31 @@ read-only connection or a read-only user is rejected with a clear message; see
 [11 Writing data](11-writing-data.md) and
 [18 Troubleshooting](18-troubleshooting.md).
 
+## Telemetry export
+
+OpenTelemetry export (`otel.*`, off by default) is an outbound data flow from
+both the server and the builder, so treat the trace store as part of the system.
+When enabled it receives:
+
+- **Query text**, in the one-line form truncated to 160 characters that the
+  `query executed` log already prints. **Parameters are never recorded as
+  attributes**, so sensitive values belong in parameters, not in literals.
+- **Failure messages** of server-side failures (truncated to 512 characters), as
+  the span status. Like the `query failed` warn log, an execution error can quote
+  a value it failed on, and that value can be a parameter.
+- The **authenticated user** (`enduser.id`), recorded only after a successful
+  `LOGON`. The principal of a *failed* attempt is never recorded, because it is
+  attacker-chosen text and sometimes a mistyped password.
+- The **client address** and port.
+- Graph names and failure codes.
+
+Read the API key through `[SECRET]:` file indirection. The server does not pass the
+key to a consolidation's builder: the builder resolves it the same way the server
+did (the same file, or the same `otel__apiKey` override if you used one), and it
+resolves only the `otel` block, not the server's other secrets. The builder now links an HTTPS
+client for this export, which is new network capability in the binary that
+publishes generations. It is inert until `otel.enabled` is set.
+
 ## Next
 
 - The write surface the `write` grant unlocks: [11 Writing data](11-writing-data.md).

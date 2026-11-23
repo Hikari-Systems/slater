@@ -13,6 +13,12 @@
   "log": {
     "level": "info"
   },
+  "otel": {
+    "enabled": "false",
+    "serviceName": "slater",
+    "endpoint": "https://api.honeycomb.io",
+    "apiKey": ""
+  },
   "dataBackend": {
     "kind": "fs",
     "fs": {

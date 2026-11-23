@@ -81,7 +81,7 @@ worked examples, then a **reference** table of the exact syntax, flags, or knobs
 - [12 Storage](12-storage.md) — storage backends (filesystem / S3 / GCS) and the
   on-disk engine, with the choices you make about each.
 - [13 Deployment](13-deployment.md) — running the server, Docker images, TLS,
-  hot-reload, and observability.
+  hot-reload, and observability (logs, OpenTelemetry traces and metrics).
 - [14 Configuration reference](14-configuration-reference.md) — every
   configuration knob, its environment-variable form, and its default.
 - [15 Security](15-security.md) — authentication, access control, encryption,
