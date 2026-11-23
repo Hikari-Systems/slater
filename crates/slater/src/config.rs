@@ -194,6 +194,15 @@ pub struct AppConfig {
     /// `db` field — slater never silently serves a graph the client did not name.
     #[serde(default)]
     pub default_graph: String,
+    /// OpenTelemetry export (traces + metrics over OTLP/HTTP): the `hs_utils::otel`
+    /// block, unchanged — `enabled`, `endpoint`, `apiKey`, `serviceName`,
+    /// `environment`, `sampleRatio`, `level`, and the metrics knobs. Off by default:
+    /// nothing is exported and no exporter thread is started until `enabled` is set.
+    /// `serviceName` defaults to `slater`. A consolidation's `slater-build` child
+    /// reads this same block, reports as `<serviceName>-build`, and joins the
+    /// consolidation's trace. See `docs/manual/` (observability).
+    #[serde(default)]
+    pub otel: hs_utils::otel::OtelConfig,
 }
 
 impl AppConfig {

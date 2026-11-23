@@ -647,7 +647,7 @@ pub(crate) async fn serve_conn(
     tls: Option<TlsAcceptor>,
     ctx: Arc<ConnCtx>,
 ) -> Result<()> {
-    let pre_auth = match PreAuth::admit(&ctx) {
+    let pre_auth = match PreAuth::admit(&ctx, sock.peer_addr().ok()) {
         Some(p) => p,
         None => return Ok(()), // antechamber full; the socket is dropped here
     };

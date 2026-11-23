@@ -25,6 +25,7 @@ mod limits_and_estimates;
 mod reload_and_integrity;
 mod resolve_and_keys;
 mod session_identity;
+mod telemetry;
 mod vector_labels;
 mod vector_ladder;
 mod writes;
@@ -341,6 +342,8 @@ fn pre_auth_session() -> Session {
         login_deadline: None,
         in_tx: false,
         tx_writes: 0,
+        peer: None,
+        run: Default::default(),
     }
 }
 
@@ -824,6 +827,8 @@ fn authenticated_session(user: &str) -> Session {
         login_deadline: None,
         in_tx: false,
         tx_writes: 0,
+        peer: None,
+        run: Default::default(),
     }
 }
 

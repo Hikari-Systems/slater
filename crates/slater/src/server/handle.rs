@@ -67,6 +67,7 @@ where
     let PreAuth {
         permit: mut pre_auth_permit,
         deadline: login_deadline,
+        peer,
     } = pre_auth;
 
     // Start under the tight pre-auth body cap; it ratchets up once LOGON succeeds. The
@@ -108,6 +109,8 @@ where
         login_deadline,
         in_tx: false,
         tx_writes: 0,
+        peer,
+        run: Default::default(),
     };
 
     loop {
@@ -212,7 +215,7 @@ where
             continue;
         }
 
-        match handle_request(&mut sess, &ctx, req).await {
+        match handle_request_traced(&mut sess, &ctx, req).await {
             Ok(msgs) => {
                 for m in &msgs {
                     framed.write_message(m).await?;
@@ -239,6 +242,68 @@ where
         }
     }
     Ok(())
+}
+
+/// [`handle_request`] inside its request span, where the request has one.
+///
+/// `RUN` gets a `bolt.run` root span, and a `HELLO`/`LOGON` that carries credentials gets
+/// `bolt.logon`. Everything else — `PULL`, `DISCARD`, `BEGIN`, `COMMIT`, … — is a buffer
+/// operation with nothing to explain, and is not traced. See `server::telemetry`.
+pub(crate) async fn handle_request_traced(
+    sess: &mut Session,
+    ctx: &Arc<ConnCtx>,
+    req: message::Request,
+) -> std::result::Result<Vec<PsValue>, Failure> {
+    use message::Request;
+    use tracing::Instrument as _;
+    match &req {
+        Request::Run { .. } => {
+            let span =
+                telemetry::run_span(sess.peer, sess.version, sess.user.as_deref().unwrap_or(""));
+            sess.run = Default::default();
+            let started = Instant::now();
+            let result = handle_request(sess, ctx, req)
+                .instrument(span.clone())
+                .await;
+            if let Err(f) = &result {
+                telemetry::record_failure(&span, f);
+            }
+            let record = std::mem::take(&mut sess.run);
+            telemetry::metrics().request_duration.record(
+                started.elapsed().as_secs_f64(),
+                &[
+                    telemetry::kv("db.namespace", record.graph.unwrap_or_default()),
+                    telemetry::kv(
+                        "db.operation.name",
+                        record.op.map_or("unknown", telemetry::Op::as_str),
+                    ),
+                    telemetry::kv("outcome", telemetry::outcome(result.as_ref().map(|_| ()))),
+                ],
+            );
+            result
+        }
+        Request::Logon(_) => logon_traced(sess, ctx, req).await,
+        Request::Hello(meta) if meta.get("scheme").is_some() => logon_traced(sess, ctx, req).await,
+        _ => handle_request(sess, ctx, req).await,
+    }
+}
+
+async fn logon_traced(
+    sess: &mut Session,
+    ctx: &Arc<ConnCtx>,
+    req: message::Request,
+) -> std::result::Result<Vec<PsValue>, Failure> {
+    use tracing::Instrument as _;
+    let span = telemetry::logon_span(sess.peer);
+    let result = handle_request(sess, ctx, req)
+        .instrument(span.clone())
+        .await;
+    match (&result, sess.user.as_deref()) {
+        (Ok(_), Some(user)) => telemetry::logon_succeeded(&span, user),
+        (Err(f), _) => telemetry::record_failure(&span, f),
+        _ => {}
+    }
+    result
 }
 
 /// Verify `basic`-scheme credentials from a `LOGON` (or 4.4 `HELLO`) metadata map
@@ -353,7 +418,11 @@ pub(crate) async fn verify_off_reactor(
     let graphs = ctx.graphs.clone();
     let principal = principal.to_string();
     let credentials = credentials.to_string();
+    // argon2id is deliberately tens of milliseconds: give it its own span, so a slow
+    // LOGON shows whether the time went to the hash or to the wait for a permit.
+    let span = tracing::info_span!("slater.auth.verify");
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         // Held until the hash is done, not until the caller stops waiting for it.
         let _permit = permit;
         // Pick up any out-of-band ACL edit before authenticating — but only adopt one
@@ -422,10 +491,22 @@ where
         .await
         .map_err(|_| Failure::new(CODE_EXECUTION, "server is shutting down".into()))?;
 
+    let span = tracing::info_span!("slater.parse");
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        span.set_attribute("slater.query.bytes", query.len() as i64);
+    }
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         // Held until the parse is done, not until the caller stops waiting for it.
         let _permit = permit;
         let parsed = parse(&query);
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            // A syntax verdict is not a server fault: the span says whether it parsed
+            // without marking it ERROR (the request span carries the Bolt failure code).
+            span.set_attribute("slater.parse.ok", parsed.is_ok());
+        }
         (query, parsed)
     })
     .await
@@ -547,6 +628,7 @@ pub(crate) async fn handle_request(
             // see the bare query. Routing is a no-op — one parser serves both
             // languages (DECISIONS D40) — so we simply drop the prefix.
             let query = strip_dialect_prefix(&query).to_string();
+            telemetry::run_query_text(&query);
             // `USE <graph>` / `USE DATABASE <graph>` selects the user's graph in-band
             // (clients that never send the Bolt `db` field, e.g. Memgraph Lab, rely on
             // this). Validate the target and remember it per-user for later db-less
@@ -567,6 +649,8 @@ pub(crate) async fn handle_request(
                     ));
                 }
                 debug!(graph = %target, "WIRE-DIAG: USE selected graph");
+                telemetry::run_graph(&mut sess.run, &target);
+                telemetry::run_op(&mut sess.run, telemetry::Op::Use);
                 ctx.set_selection(&user, &target);
                 sess.pending = Some(Pending {
                     rows: vec![],
@@ -592,6 +676,7 @@ pub(crate) async fn handle_request(
                 sticky.as_deref(),
                 ctx.is_memgraph(&user),
             )? {
+                telemetry::run_op(&mut sess.run, telemetry::Op::Introspect);
                 sess.pending = Some(Pending { rows, sent: 0 });
                 return Ok(vec![message::success(vec![(
                     "fields".into(),
@@ -638,6 +723,7 @@ pub(crate) async fn handle_request(
             let gen = ctx.graphs.get(&graph).ok_or_else(|| {
                 Failure::new(CODE_NOT_FOUND, format!("graph '{graph}' is not served"))
             })?;
+            telemetry::run_graph(&mut sess.run, &graph);
             let param_vals = params_to_vals(&params)?;
             // The writable layer is per-graph and off unless configured; when it is
             // on, a query may be a write. The parse itself runs off the reactor (see
@@ -669,6 +755,16 @@ pub(crate) async fn handle_request(
                         }
                     })?;
                     // A `read` grant selected the graph; mutating it needs `write` too.
+                    telemetry::run_op(
+                        &mut sess.run,
+                        match &stmt {
+                            parser::ast::Statement::Write(_) => telemetry::Op::Write,
+                            parser::ast::Statement::Create(_) => telemetry::Op::Create,
+                            parser::ast::Statement::WriteEdge(_) => telemetry::Op::WriteEdge,
+                            parser::ast::Statement::Consolidate => telemetry::Op::Consolidate,
+                            parser::ast::Statement::Read(_) => telemetry::Op::Read,
+                        },
+                    );
                     authorize_statement(&ctx.acl.snapshot(), &user, &graph, &stmt)?;
                     match stmt {
                         // The three write shapes all execute off the reactor, under the
@@ -746,6 +842,7 @@ pub(crate) async fn handle_request(
                             Failure::from_query_error(&e)
                         }
                     })?;
+                    telemetry::run_op(&mut sess.run, telemetry::Op::Read);
                     run_query(
                         ctx,
                         gen,

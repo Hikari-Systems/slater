@@ -30,7 +30,8 @@ pub(crate) async fn maybe_maintain_delta(
     if !writer.is_consolidating() {
         if ctx.memtable_bytes > 0 && writer.bytes() >= ctx.memtable_bytes {
             let w = writer.clone();
-            match tokio::task::spawn_blocking(move || w.flush_to_l0()).await {
+            let span = tracing::info_span!("slater.delta.flush");
+            match tokio::task::spawn_blocking(move || span.in_scope(|| w.flush_to_l0())).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     warn!(graph = %graph, error = %format!("{e:#}"), "delta flush_to_l0 failed")
@@ -40,7 +41,8 @@ pub(crate) async fn maybe_maintain_delta(
         }
         if ctx.l0_compaction_trigger > 0 && writer.l0_len() >= ctx.l0_compaction_trigger {
             let w = writer.clone();
-            match tokio::task::spawn_blocking(move || w.compact_l0()).await {
+            let span = tracing::info_span!("slater.delta.compact");
+            match tokio::task::spawn_blocking(move || span.in_scope(|| w.compact_l0())).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     warn!(graph = %graph, error = %format!("{e:#}"), "delta compact_l0 failed")
@@ -210,6 +212,7 @@ pub(crate) fn window_permits(
 /// warn.
 pub(crate) fn spawn_auto_consolidation(ctx: Arc<ConnCtx>, graph: String) {
     tokio::spawn(async move {
+        // `tokio::spawn` leaves no current span, so `slater.consolidate` is a root.
         match execute_consolidate(&ctx, &graph).await {
             Ok(_) => info!(graph = %graph, "auto-consolidation folded the delta into a fresh core"),
             Err(e) if e.code == CODE_CONSOLIDATION_IN_PROGRESS => {
@@ -266,6 +269,34 @@ pub(crate) async fn execute_consolidate(
     ctx: &Arc<ConnCtx>,
     graph: &str,
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    use tracing::Instrument as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    // A child of the `bolt.run` for `CALL slater.consolidate()`; a root of its own for
+    // an auto-consolidation (`tokio::spawn` carries no span). The builder child joins
+    // this trace through `TRACEPARENT` — see `run_builder`.
+    let span = tracing::info_span!("slater.consolidate");
+    span.set_attribute("db.namespace", graph.to_string());
+    let started = Instant::now();
+    let result = execute_consolidate_inner(ctx, graph)
+        .instrument(span.clone())
+        .await;
+    if let Err(f) = &result {
+        telemetry::record_failure(&span, f);
+    }
+    telemetry::metrics().consolidation_duration.record(
+        started.elapsed().as_secs_f64(),
+        &[
+            telemetry::kv("db.namespace", graph.to_string()),
+            telemetry::kv("outcome", telemetry::outcome(result.as_ref().map(|_| ()))),
+        ],
+    );
+    result
+}
+
+async fn execute_consolidate_inner(
+    ctx: &Arc<ConnCtx>,
+    graph: &str,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     let graphs = ctx.graphs.clone();
     let cache = ctx.cache.clone();
     let vector_cache = ctx.vector_cache.clone();
@@ -282,7 +313,10 @@ pub(crate) async fn execute_consolidate(
     // ACL keeps serving, and a rebuild must be stamped against the one actually serving.
     let acl_pin = Some(ctx.acl.digest());
     let gc_graph = graph.clone(); // retained for the post-consolidation GC sweep below
+    let span = tracing::Span::current();
     let new_uuid = tokio::task::spawn_blocking(move || {
+        // Entered so `run_builder` can hand this trace to the child (`TRACEPARENT`).
+        let _entered = span.enter();
         graphs.consolidate_graph(
             &graph,
             &cache,

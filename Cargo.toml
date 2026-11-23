@@ -34,6 +34,17 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# OpenTelemetry API, for what `hs_utils::otel` does not wrap: span attributes and
+# status (`OpenTelemetrySpanExt`), the `TRACEPARENT` handoff to the slater-build
+# child, and the query metrics. The versions MUST match hs-utils' (opentelemetry
+# 0.32 / tracing-opentelemetry 0.33): a second copy would be a second global
+# provider that nothing exports. No SDK here — the exporter is hs-utils'.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+# Test-only: an in-memory span exporter, so tests assert the spans and attributes
+# actually produced, through the same `tracing-opentelemetry` layer production uses.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Async + server (slater).

@@ -78,6 +78,7 @@ mod query;
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
 // The `Graphs` registry and `ConnCtx` impls live in these child modules.
 mod registry;
+pub(crate) mod telemetry;
 mod write;
 
 // Re-export each child module's items at the `server` scope so sibling modules
@@ -672,7 +673,20 @@ pub fn run_builder(
     // pipe it over stdin, keeping the child's environment as clean as the server's.
     let via_env = master_key.is_some().then_some(key_env).flatten();
     let via_stdin = master_key.is_some() && via_env.is_none();
+    // The builder process, as one span: the child's own spans (`slater_build.run` and
+    // a span per phase) parent on it through `TRACEPARENT`.
+    let span = tracing::info_span!("slater.builder", otel.kind = "client");
+    let _entered = span.enter();
+    let trace_env = telemetry::child_trace_env();
     let child = spawn_builder(builder_bin, |cmd| {
+        // Continue this trace in the child — or, with nothing to continue, make sure it
+        // does not inherit one: a `TRACEPARENT` in the server's own environment (set by
+        // whatever launched it) belongs to the server's start-up, not to this build.
+        cmd.env_remove(telemetry::TRACEPARENT_ENV)
+            .env_remove(telemetry::TRACESTATE_ENV);
+        for (k, v) in &trace_env {
+            cmd.env(k, v);
+        }
         cmd.arg("--input")
             .arg(dump)
             .arg("--input-format")
@@ -770,6 +784,17 @@ pub fn run_builder(
     let status = wait_with_timeout(&handle, limits.timeout_secs, graph);
     let out = finish(&handle, &mut drains);
     let status = status.with_context(|| format!("wait for builder '{builder_bin}'{out}"))?;
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        if let Some(code) = status.code() {
+            span.set_attribute("process.exit.code", i64::from(code));
+        }
+        if !status.success() {
+            span.set_status(opentelemetry::trace::Status::error(format!(
+                "builder exited with {status}"
+            )));
+        }
+    }
     if !status.success() {
         bail!("builder '{builder_bin}' exited with {status} while consolidating '{graph}'{out}");
     }
@@ -859,7 +884,7 @@ fn guard_sweep(
             ReloadStrategy::Exit => return SweepAction::Shutdown(name),
             // We already hold the swap mutex, so call the locked body directly (a std
             // `Mutex` is not reentrant).
-            ReloadStrategy::Swap => match graphs.swap_locked_guard(&name, vector_cache) {
+            ReloadStrategy::Swap => match traced_swap(graphs, &name, vector_cache) {
                 Ok(Some(new)) => {
                     info!(graph = %name, generation = %new, "swapped to a new generation (reloadStrategy=swap)");
                     // Adopt the ACL published alongside the new generation — this is the
@@ -887,6 +912,26 @@ fn guard_sweep(
         }
     }
     SweepAction::Continue
+}
+
+/// [`Graphs::swap_locked_guard`] as a `slater.generation.swap` root span: the guard is a
+/// background poll, and a swap it makes is the event an operator correlates query
+/// latency against.
+fn traced_swap(
+    graphs: &Graphs,
+    name: &str,
+    vector_cache: &VectorIndexCache,
+) -> Result<Option<GenId>> {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let span = tracing::info_span!(parent: None, "slater.generation.swap");
+    let swapped = span.in_scope(|| graphs.swap_locked_guard(name, vector_cache));
+    span.set_attribute("db.namespace", name.to_string());
+    match &swapped {
+        Ok(Some(new)) => span.set_attribute("slater.generation", new.to_string()),
+        Ok(None) => span.set_attribute("slater.swap.raced", true),
+        Err(e) => telemetry::record_error(&span, e),
+    }
+    swapped
 }
 
 /// Spawn the background generation guard: a task that polls each graph's `current`
@@ -1408,6 +1453,13 @@ pub(crate) struct Session {
     /// Write statements executed since `BEGIN`. Non-zero at `ROLLBACK` means durable
     /// writes were **not** undone, which is what the client is warned about.
     tx_writes: u32,
+    /// The client's socket address (connection state, not user state: it survives a
+    /// re-`LOGON`). Recorded on every request span.
+    peer: Option<std::net::SocketAddr>,
+    /// What the `RUN` in flight resolved to — its graph and operation — once each has
+    /// been *validated*, for the request metric's attributes. Reset per `RUN`. Only
+    /// validated values land here, so the metric's cardinality is the served graphs.
+    run: telemetry::RunRecord,
 }
 
 impl Session {
@@ -1562,13 +1614,16 @@ pub(crate) struct PreAuth {
     /// `LOGON` — as a single budget. Armed once, so advancing a stage does not refresh
     /// the allowance and no stage boundary leaves a gap for a slow peer to sit in.
     deadline: Option<TokioInstant>,
+    /// The client's socket address, for the request spans' `client.address` (see
+    /// `server::telemetry`). `None` where the stream has no peer (an in-process test).
+    peer: Option<std::net::SocketAddr>,
 }
 
 impl PreAuth {
     /// Admit a freshly accepted socket to the antechamber, or `None` when it is full.
     /// Rejecting rather than queueing is the point: parking anonymous sockets would just
     /// hold file descriptors, the very exhaustion this defends against.
-    fn admit(ctx: &Arc<ConnCtx>) -> Option<Self> {
+    fn admit(ctx: &Arc<ConnCtx>, peer: Option<std::net::SocketAddr>) -> Option<Self> {
         let permit = match ctx.pre_auth_limit.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -1581,6 +1636,7 @@ impl PreAuth {
             permit: Some(permit),
             deadline: (ctx.login_timeout_ms > 0)
                 .then(|| TokioInstant::now() + Duration::from_millis(ctx.login_timeout_ms)),
+            peer,
         })
     }
 

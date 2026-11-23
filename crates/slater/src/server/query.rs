@@ -55,8 +55,14 @@ pub(crate) async fn run_query(
     let instrument = tracing::enabled!(Level::INFO) || ctx.diag.enabled;
 
     ctx.diag.on_query_start();
+    // The blocking pool does not inherit the caller's span; carry it across so the
+    // execute/encode spans parent on this RUN's `bolt.run`.
+    let parent = tracing::Span::current();
+    let metric_graph = graph_name.clone();
     let join =
         tokio::task::spawn_blocking(move || -> Result<(EncodedRows, Option<QueryTiming>)> {
+            let exec_span = tracing::info_span!(parent: &parent, "slater.execute");
+            let exec_guard = exec_span.enter();
             // Per-query instrumentation (only when `instrument`): wall-clock split into
             // execute vs encode, and the block-cache hit/miss/eviction delta this query
             // caused (the counters are process-wide, so we snapshot before/after). A
@@ -113,6 +119,17 @@ pub(crate) async fn run_query(
                 }
             };
             let t_after_exec = instrument.then(Instant::now);
+            {
+                use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+                exec_span.set_attribute("slater.result_cache.hit", result_cache_hit);
+                if let Some(cost) = cost {
+                    exec_span.set_attribute("slater.query.cost", cost as i64);
+                }
+                exec_span.set_attribute("db.response.returned_rows", result.rows.len() as i64);
+            }
+            drop(exec_guard);
+            let encode_span = tracing::info_span!(parent: &parent, "slater.encode");
+            let _encode_guard = encode_span.enter();
 
             // Encode for this connection's version. A plain engine (no params/limits
             // needed) resolves Node/Relationship records through the shared block
@@ -132,6 +149,30 @@ pub(crate) async fn run_query(
                 let t_end = Instant::now();
                 let blk_after = cache.metrics();
                 let blk_before = blk_before.unwrap();
+                {
+                    // On the execute span (the cache traffic is execution's, plus the
+                    // record lookups encode makes through the same cache).
+                    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+                    let hits = blk_after.hits.saturating_sub(blk_before.hits);
+                    let misses = blk_after.misses.saturating_sub(blk_before.misses);
+                    exec_span.set_attribute("slater.block_cache.hits", hits as i64);
+                    exec_span.set_attribute("slater.block_cache.misses", misses as i64);
+                    let m = super::telemetry::metrics();
+                    let graph = super::telemetry::kv("db.namespace", metric_graph);
+                    m.block_cache.add(
+                        hits,
+                        &[graph.clone(), super::telemetry::kv("result", "hit")],
+                    );
+                    m.block_cache.add(
+                        misses,
+                        &[graph.clone(), super::telemetry::kv("result", "miss")],
+                    );
+                    if cacheable {
+                        let result = if result_cache_hit { "hit" } else { "miss" };
+                        m.result_cache
+                            .add(1, &[graph, super::telemetry::kv("result", result)]);
+                    }
+                }
                 let t_start = t_start.unwrap();
                 let t_after_exec = t_after_exec.unwrap();
                 Some(QueryTiming {

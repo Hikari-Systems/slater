@@ -36,6 +36,7 @@ pub mod parser;
 pub mod resolve;
 pub mod set_eval;
 pub mod shared;
+pub mod telemetry;
 
 // The surface a caller actually needs to run a build, re-exported so it does not have to
 // know which module each piece lives in.

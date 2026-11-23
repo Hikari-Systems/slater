@@ -410,6 +410,7 @@ async fn a_stalled_pre_auth_write_is_bounded_by_the_login_deadline() {
     let pre_auth = PreAuth {
         permit: Some(permit),
         deadline: Some(TokioInstant::now() + Duration::from_millis(200)),
+        peer: None,
     };
     let stream = StallWriter {
         hello: client_hello(),
@@ -441,6 +442,7 @@ async fn a_stalled_pre_auth_write_is_bounded_by_the_login_deadline() {
     let pre_auth2 = PreAuth {
         permit: Some(permit2),
         deadline: None,
+        peer: None,
     };
     let stream2 = StallWriter {
         hello: client_hello(),
@@ -475,7 +477,7 @@ async fn tls_handshake_deadline_is_the_sooner_of_the_two_bounds() {
                 ..Default::default()
             },
         );
-        let pre_auth = PreAuth::admit(&ctx).expect("antechamber is empty");
+        let pre_auth = PreAuth::admit(&ctx, None).expect("antechamber is empty");
         let now = TokioInstant::now();
         pre_auth
             .tls_deadline(&ctx)

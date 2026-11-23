@@ -47,7 +47,10 @@ fn main() -> anyhow::Result<()> {
     // runtime is built; it needs only the default port from config.
     dump::dump_subcommand(default_port);
 
-    let cfg = config::load()?;
+    let mut cfg = config::load()?;
+    if cfg.otel.service_name.trim().is_empty() {
+        cfg.otel.service_name = "slater".to_string();
+    }
 
     // `query` runs one Cypher statement in-process against a mounted generation
     // and exits — a scripting/CI convenience. It needs the resolved config (for
@@ -56,7 +59,23 @@ fn main() -> anyhow::Result<()> {
     // async runtime is built. It inits its own logging (or none, under `-q`).
     query::query_subcommand(&cfg);
 
-    hs_utils::logging::init(&cfg.log.level);
+    // Build the tokio runtime ourselves (the stdlib-only subcommands above must run
+    // before any async machinery). Logging is installed from inside it: the OTLP
+    // exporter's runtime gauges look for the current runtime when they start.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Query execution and storage reads run on the blocking pool; raise its size
+    // for a remote backend, where each in-flight cold read parks one thread on
+    // the network round-trip. 0 keeps the tokio default.
+    if cfg.server.max_blocking_threads > 0 {
+        builder.max_blocking_threads(cfg.server.max_blocking_threads);
+    }
+    let runtime = builder.build().context("build tokio runtime")?;
+
+    // stdout logging always, plus OTLP traces + metrics when `otel.enabled` (inert
+    // otherwise — this is then exactly `hs_utils::logging::init`). The guard flushes
+    // whatever is still queued when it drops, so it lives until `main` returns.
+    let mut otel = runtime.block_on(async { hs_utils::otel::init(&cfg.log.level, &cfg.otel) })?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = %cfg.server.bind,
@@ -67,18 +86,53 @@ fn main() -> anyhow::Result<()> {
         "starting slater (Bolt graph engine)"
     );
 
-    // Build the tokio runtime ourselves (the stdlib-only subcommands above must run
-    // before any async machinery), then hand off to the Bolt listener, which opens
-    // every graph under `data_dir`, loads the ACL, and serves connections until the
-    // process is signalled.
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    // Query execution and storage reads run on the blocking pool; raise its size
-    // for a remote backend, where each in-flight cold read parks one thread on
-    // the network round-trip. 0 keeps the tokio default.
-    if cfg.server.max_blocking_threads > 0 {
-        builder.max_blocking_threads(cfg.server.max_blocking_threads);
+    // Hand off to the Bolt listener, which opens every graph under `data_dir`, loads
+    // the ACL, and serves connections until the process is signalled.
+    //
+    // A signal normally kills the process outright, which would drop the spans of
+    // the last few seconds — typically the ones that explain why it was stopped. So
+    // with export on, SIGTERM/SIGINT flush first and then exit as the signal would
+    // have (128 + signo). With export off nothing is installed, and a signal does
+    // exactly what it always did.
+    let flush_on_signal = cfg.otel.enabled;
+    let served = runtime.block_on(async move {
+        if !flush_on_signal {
+            return server::serve(cfg).await.map(|()| None);
+        }
+        tokio::select! {
+            r = server::serve(cfg) => r.map(|()| None),
+            code = termination_signal() => Ok(Some(code)),
+        }
+    });
+    // Off the runtime: the exporters' shutdown blocks on their own threads.
+    otel.shutdown();
+    match served? {
+        Some(code) => std::process::exit(code),
+        None => Ok(()),
     }
-    let runtime = builder.build().context("build tokio runtime")?;
-    runtime.block_on(server::serve(cfg))
+}
+
+/// Wait for SIGTERM or SIGINT; returns the exit code the signal's default action
+/// implies (128 + signo). Only awaited when OTLP export is on — see `main`.
+#[cfg(unix)]
+async fn termination_signal() -> i32 {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut term, mut int) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(t), Ok(i)) => (t, i),
+        // Cannot listen: never resolve, leaving the default (immediate) action.
+        _ => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = term.recv() => { info!("SIGTERM: flushing telemetry and exiting"); 143 }
+        _ = int.recv() => { info!("SIGINT: flushing telemetry and exiting"); 130 }
+    }
+}
+
+#[cfg(not(unix))]
+async fn termination_signal() -> i32 {
+    let _ = tokio::signal::ctrl_c().await;
+    130
 }

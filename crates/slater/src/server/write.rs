@@ -804,7 +804,11 @@ pub(crate) async fn execute_write_off_reactor(
 
     let writer = writer.clone();
     let gen = gen.clone();
+    // WAL append + fsync + memtable apply, on the blocking pool; the span starts after
+    // the `maxConcurrentWrites` permit, so queueing for one shows as the gap before it.
+    let span = tracing::info_span!("slater.write");
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         // Held until the write is done, not until the caller stops waiting for it.
         let _permit = permit;
         job.run(&writer, gen.as_ref(), &params, version)

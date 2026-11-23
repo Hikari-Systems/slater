@@ -227,6 +227,11 @@ impl BuildDiag {
     /// (JSONL), sets the memo phase, and returns a guard that logs completion with
     /// timing and records `phase_end` on drop.
     pub fn phase(&self, name: &str) -> PhaseGuard<'_> {
+        // One span per phase, whether or not diagnostics are on: it is what a build's
+        // trace is made of (see `crate::telemetry`). Entered for the phase's life, so the
+        // phase's own log events land in it; rayon workers do not inherit it.
+        let span = tracing::info_span!("slater_build.phase", otel.name = %format!("build.{name}"))
+            .entered();
         if let Some(inner) = &self.inner {
             BuildMemo::set_str(&inner.memo.phase, name);
             // Reset per-phase progress + peak so a new phase starts clean.
@@ -256,12 +261,14 @@ impl BuildDiag {
                 inner: Some(inner),
                 name: name.to_string(),
                 base,
+                _span: span,
             }
         } else {
             PhaseGuard {
                 inner: None,
                 name: String::new(),
                 base: Baseline::empty(),
+                _span: span,
             }
         }
     }
@@ -386,6 +393,9 @@ pub struct PhaseGuard<'a> {
     inner: Option<&'a Arc<Inner>>,
     name: String,
     base: Baseline,
+    /// The phase's span. A field, so it closes after `Drop::drop` has run — the "done"
+    /// line and the JSONL `phase_end` happen inside it.
+    _span: tracing::span::EnteredSpan,
 }
 
 impl Drop for PhaseGuard<'_> {
@@ -414,6 +424,21 @@ impl Drop for PhaseGuard<'_> {
             _ => (None, None),
         };
         let rss_peak = inner.memo.rss_peak.load(Ordering::Relaxed);
+        {
+            // The resource deltas `--diagnostics` measured, on the phase span too.
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            let span = &*self._span;
+            if let Some(cpu) = cpu_delta {
+                span.set_attribute("process.cpu.time", cpu);
+            }
+            if let (Some(r), Some(w)) = (io_r, io_w) {
+                span.set_attribute("process.disk.read_bytes", r as i64);
+                span.set_attribute("process.disk.write_bytes", w as i64);
+            }
+            if rss_peak > 0 {
+                span.set_attribute("process.memory.peak_rss", rss_peak as i64);
+            }
+        }
         inner.write_value(&json!({
             "kind": "phase_end",
             "t_ms": inner.now_ms(),

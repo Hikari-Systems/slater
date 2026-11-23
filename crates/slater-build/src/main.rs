@@ -563,13 +563,42 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Install hs-utils-style logging so the build's progress lines (and any
-    // warnings) reach stdout. `-q`/`--quiet` skips the subscriber, so the macros
-    // become no-ops and the build runs silent but for errors.
-    if !cli.quiet {
-        hs_utils::logging::init("info");
+    // warnings) reach stdout — plus OTLP traces and process metrics when the `otel`
+    // block enables them (see `slater_build::telemetry`; inert by default).
+    // `-q`/`--quiet` keeps stdout silent but for errors; export, if on, still runs.
+    let mut otel = slater_build::telemetry::init(cli.quiet);
+    let result = traced_build(&cli);
+    // Flush before the process exits. An `Err` from `main` exits after this returns,
+    // so the failure's spans are exported too.
+    if let Some(otel) = otel.as_mut() {
+        otel.shutdown();
     }
+    result
+}
 
-    let encryption_key = resolve_master_key(&cli)?;
+/// The build, as one `slater_build::run` span — a child of the caller's trace when
+/// `TRACEPARENT` names one (a consolidation's server does).
+fn traced_build(cli: &Cli) -> Result<()> {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let span = slater_build::telemetry::run_span(
+        &cli.graph,
+        &format!("{:?}", cli.input_format),
+        slater_build::telemetry::parent_from_env(),
+    );
+    let _entered = span.enter();
+    let result = build(cli);
+    match &result {
+        Ok(()) => {}
+        Err(e) => {
+            span.set_attribute("error.type", "build");
+            span.set_status(opentelemetry::trace::Status::error(format!("{e:#}")));
+        }
+    }
+    result
+}
+
+fn build(cli: &Cli) -> Result<()> {
+    let encryption_key = resolve_master_key(cli)?;
     let acl_blake3 = match &cli.acl {
         Some(p) => Some(
             graph_format::integrity::hash_file(p)
@@ -577,10 +606,10 @@ fn main() -> Result<()> {
         ),
         None => None,
     };
-    let threads = resolve_threads(&cli);
-    let publish_store = resolve_publish_store(&cli)?;
-    let (zstd_level, compression_profile) = resolve_compression(&cli, publish_store.is_some());
-    let degree_zstd_margin = resolve_degree_zstd_margin(&cli, publish_store.is_some());
+    let threads = resolve_threads(cli);
+    let publish_store = resolve_publish_store(cli)?;
+    let (zstd_level, compression_profile) = resolve_compression(cli, publish_store.is_some());
+    let degree_zstd_margin = resolve_degree_zstd_margin(cli, publish_store.is_some());
     if cli.pk.is_some() && matches!(cli.input_format, InputFormat::SlaterDump) {
         anyhow::bail!("--pk cannot be combined with --input-format=slater-dump");
     }
@@ -622,13 +651,21 @@ fn main() -> Result<()> {
     graph_format::blockfile::configure_seal_threads(threads);
 
     let data_dir = PathBuf::from(&cli.data_dir);
-    let mut diag = make_diag(&cli, &data_dir)?;
+    let mut diag = make_diag(cli, &data_dir)?;
 
     // The bounded-memory external build is the only build path: it opens the input
     // path itself (so it can seek a file for mid-pass-1 resume) and spills to disk,
     // so it serves graphs of any size without holding the whole graph in RAM.
     let outcome = build_external(&cli.input, &cli.graph, &data_dir, &opts, &diag)?;
     diag.finish();
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let span = tracing::Span::current(); // `slater_build.run`
+        span.set_attribute("slater.generation", outcome.generation.to_string());
+        span.set_attribute("slater_build.nodes", outcome.node_count as i64);
+        span.set_attribute("slater_build.edges", outcome.edge_count as i64);
+        span.set_attribute("slater_build.threads", threads as i64);
+    }
     // Stdout is the machine-facing channel: print the generation UUID + content
     // hash so a publishing pipeline can record exactly what it built.
     println!(
