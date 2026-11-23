@@ -755,18 +755,42 @@ mod tests {
     #[test]
     fn encrypted_postings_roundtrip_and_hide_plaintext() {
         let cipher = Some(Arc::new(BlockCipher::from_key(&[7u8; 32])));
-        // Source id 0x4242 should not appear verbatim in the ciphertext.
-        let edges = vec![edge(0x4242, 1, 0, 0)];
+        // Enough distinct source ids that the encoded posting record is long. The old
+        // check (no `42 42` anywhere in the file) failed whenever those two bytes turned
+        // up in the random ciphertext by chance; a 100+ byte record never does.
+        let ids: Vec<u64> = (0..64u64).map(|i| 0x4242 + i * 977).collect();
+        let edges: Vec<Edge> = ids.iter().map(|&s| edge(s, 1, 0, 0)).collect();
+
+        // The same postings in plaintext: its record bytes are what must not leak.
+        let pp = tmp("plain_src");
+        let ptp = tmp("plain_tgt");
+        write_reltype_endpoint_postings(&pp, &ptp, 1, &edges, 4096, 3, None).unwrap();
+        let plain_rec = BlockFileReader::open(&pp)
+            .unwrap()
+            .read_record_global(0)
+            .unwrap();
+        assert!(
+            plain_rec.len() >= 16,
+            "record too short to test for: {}",
+            plain_rec.len()
+        );
+        let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        // Sanity: unencrypted, the record is stored verbatim, so the check below would
+        // catch a file that was never encrypted.
+        assert!(contains(&std::fs::read(&pp).unwrap(), &plain_rec));
+
         let sp = tmp("enc_src");
         let tp = tmp("enc_tgt");
         write_reltype_endpoint_postings(&sp, &tp, 1, &edges, 4096, 3, cipher.clone()).unwrap();
-
         let raw = std::fs::read(&sp).unwrap();
-        assert!(!raw.windows(2).any(|w| w == [0x42, 0x42]));
+        assert!(
+            !contains(&raw, &plain_rec),
+            "the plaintext posting record appears in the encrypted file"
+        );
 
         let sr = BlockFileReader::open_with_cipher(&sp, file_cipher(&cipher, "reltype_src.post"))
             .unwrap();
         let got = decode_endpoint_posting(&sr.read_record_global(0).unwrap()).unwrap();
-        assert_eq!(got, vec![0x4242]);
+        assert_eq!(got, ids);
     }
 }
